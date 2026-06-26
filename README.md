@@ -16,7 +16,7 @@ While the game is not fully booting yet, significant hurdles in the boot sequenc
 * **RC4 Cipher Loop:** Successfully navigating the game's early execution RC4 decryption loops.
 * **Zone Mapping:** Implemented fixes for the game's memory zone allocation and asset mapping logic.
 
-**Testing Environment:** * Currently testing strictly under Interpreter Mode (`BOX64_DYNAREC=0`). Nothing, but just because redactedbarbone.exe doesn't work with dynarec
+**Testing Environment:** * Currently testing strictly under Interpreter Mode (`BOX64_DYNAREC=0`). Nothing, but just because redactedbarebone.exe doesn't work with dynarec
 
 ---
 
