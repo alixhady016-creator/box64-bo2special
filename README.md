@@ -21,9 +21,9 @@ While the game is not fully booting yet, significant hurdles in the boot sequenc
 ---
 
 ## Tools used
-* **Ghidra:**
-* **Winlator:**
-* **VS Code:**
+* **Ghidra:** For static analysis
+* **Winlator:** For android testing
+* **VS Code:** For patching box64 v0.3.8
 
 ---
 
