@@ -36,6 +36,7 @@ extern int box64_tcmalloc_minimal;  // when using tcmalloc_minimal
 #define LOG_DEBUG 2
 #define LOG_NEVER 3
 #define LOG_VERBOSE 3
+#define LOG_ERROR LOG_NONE
 
 
 #define printf_log_prefix(prefix, L, ...)                                                              \

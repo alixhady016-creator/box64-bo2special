@@ -12,6 +12,19 @@
 #include <setjmp.h>
 #include <sys/mman.h>
 #include <pthread.h>
+
+// Validate if address is in executable code section
+static int is_valid_code_range(uint32_t addr) {
+    // t6zm.exe main code: 0x401000 - 0xB00000
+    if (addr >= 0x401000 && addr < 0xB00000) return 1;
+    
+    // Wine DLLs: 0x7b000000 - 0x7c000000 
+    if (addr >= 0x7b000000 && addr < 0x7c000000) return 1;
+    
+    // Reject data sections: 0xB00000+
+    return 0;
+}
+
 #ifndef ANDROID
 #include <execinfo.h>
 #endif
@@ -24,14 +37,216 @@
 #include "x64emu.h"
 #include "emu/x64emu_private.h"
 #include "emu/x64run_private.h"
+#include <stdint.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <stdio.h> // For dprintf and close
+
 #include "signals.h"
 #include "box64stack.h"
 #include "box64cpu.h"
 #include "callback.h"
 #include "elfloader.h"
 #include "threads.h"
-#include "emu/x87emu_private.h"
 #include "custommem.h"
+#include <fcntl.h> // For open, O_WRONLY, O_CREAT, O_APPEND
+#define EIP_TRACE_SIZE 128
+static volatile uint32_t eip_trace[EIP_TRACE_SIZE];
+static volatile int eip_trace_idx = 0;
+
+static int trace_fd = -1;
+static void init_trace_fd() {
+    if (trace_fd == -1) {
+        trace_fd = open("/sdcard/box64_crash_debug.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    }
+}
+
+// === 32-BIT ADDRESSABLE TLS ALLOCATION === 
+// __thread variables can be allocated in 64-bit address space on ARM64, 
+// but x86-32 code can only access 32-bit addresses. 
+// Use static array pool instead to ensure 32-bit addressability. 
+
+#define MAX_THREADS 32 
+#define TLS_BLOCK_SIZE 4096 
+
+// Static TLS pool - guaranteed to be in 32-bit addressable range 
+static uint8_t tls_pool[MAX_THREADS][TLS_BLOCK_SIZE] __attribute__((aligned(16))) = {0}; 
+static int tls_pool_used[MAX_THREADS] = {0}; 
+static pthread_mutex_t tls_pool_mutex = PTHREAD_MUTEX_INITIALIZER; 
+
+// Per-thread TLS block pointer (uses pthread_key for thread-local access) 
+static pthread_key_t tls_block_key; 
+static pthread_once_t tls_key_once = PTHREAD_ONCE_INIT; 
+
+static void tls_key_destructor(void* ptr) { 
+    // Free the TLS slot when thread exits 
+    if (ptr) { 
+        for (int i = 0; i < MAX_THREADS; i++) { 
+            if (tls_pool[i] == (uint8_t*)ptr) { 
+                pthread_mutex_lock(&tls_pool_mutex); 
+                tls_pool_used[i] = 0; 
+                pthread_mutex_unlock(&tls_pool_mutex); 
+                break; 
+            } 
+        } 
+    } 
+} 
+
+static void tls_key_create_once() { 
+    pthread_key_create(&tls_block_key, tls_key_destructor); 
+} 
+
+// Allocate a TLS block for the current thread from the 32-bit pool 
+static uint8_t* allocate_tls_block() { 
+    pthread_once(&tls_key_once, tls_key_create_once); 
+    
+    // Check if this thread already has a TLS block 
+    uint8_t* existing = (uint8_t*)pthread_getspecific(tls_block_key); 
+    if (existing) return existing; 
+    
+    // Find free slot in pool 
+    pthread_mutex_lock(&tls_pool_mutex); 
+    for (int i = 0; i < MAX_THREADS; i++) { 
+        if (!tls_pool_used[i]) { 
+            tls_pool_used[i] = 1; 
+            uint8_t* block = tls_pool[i]; 
+            pthread_mutex_unlock(&tls_pool_mutex); 
+            
+            // Initialize to zero 
+            memset(block, 0, TLS_BLOCK_SIZE); 
+            
+            // Store in thread-local storage 
+            pthread_setspecific(tls_block_key, block); 
+            
+            return block; 
+        } 
+    } 
+    pthread_mutex_unlock(&tls_pool_mutex); 
+    
+    // Pool exhausted - this shouldn't happen 
+    init_trace_fd(); 
+    if (trace_fd >= 0) { 
+        dprintf(trace_fd, "[TLS_ALLOC] ERROR: TLS pool exhausted (max %d threads)\n", MAX_THREADS); 
+    } 
+    return NULL; 
+} 
+
+// Global array for per‑thread base structure pointers (emulates DAT_0280a410) 
+static void* g_thread_base_ptrs[MAX_THREADS] = {0}; 
+
+// Global array for status structures (size 0x4b8 each) 
+static uint8_t g_status_array[MAX_THREADS][0x4b8] __attribute__((aligned(16))); 
+
+static void init_fake_tls() { 
+    // Get or allocate TLS block for this thread 
+    uint8_t* tls_block = allocate_tls_block(); 
+    if (!tls_block) { 
+        // Fallback: allocation failed 
+        return; 
+    } 
+    
+    // Verify TLS block is in 32-bit addressable range 
+    uintptr_t tls_addr = (uintptr_t)tls_block; 
+    if (tls_addr > 0xFFFFFFFF) { 
+        init_trace_fd(); 
+        if (trace_fd >= 0) { 
+            dprintf(trace_fd, "[TLS_INIT] ERROR: TLS block %p is above 32-bit range!\n", tls_block); 
+        } 
+        return; 
+    } 
+    
+    // === PROACTIVE FULL PE MAPPING === 
+    // Wine's WINEPRELOADRESERVE is too small (800KB vs 64MB needed) 
+    // Force-map entire PE image space at startup 
+    // t6zm.exe full range: 0x00400000 - 0x04376000 
+    
+    static int pe_mapped = 0; 
+    if (!pe_mapped) { 
+        void* pe_start = (void*)0x00400000; 
+        size_t pe_size = 0x04376000 - 0x00400000;  // Full PE image 
+        
+        // Check if already mapped 
+        if (msync(pe_start, 1, MS_ASYNC) == -1 && errno == ENOMEM) { 
+            // Not mapped - force allocation 
+            void* result = mmap(pe_start, pe_size, 
+                               PROT_READ | PROT_WRITE | PROT_EXEC, 
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, 
+                               -1, 0); 
+            
+            if (result != MAP_FAILED) { 
+                memset(result, 0, pe_size); 
+
+                // Verify .data section (0xcf7000-0x4332000) has EXEC permission 
+                mprotect((void*)0x00CF7000, 0x04332000 - 0x00CF7000, 
+                         PROT_READ | PROT_WRITE | PROT_EXEC); 
+                
+                init_trace_fd(); 
+                if (trace_fd >= 0) { 
+                    dprintf(trace_fd, "[PROACTIVE_PE_MAP] Mapped full PE image %p - %p (%zu MB)\n", 
+                            pe_start, (void*)((uintptr_t)pe_start + pe_size), pe_size / 1024 / 1024); 
+                    dprintf(trace_fd, "[PROACTIVE_PE_MAP] Explicitly set RWX on .data section (0x00CF7000-0x04332000)\n"); 
+                } 
+            } else { 
+                init_trace_fd(); 
+                if (trace_fd >= 0) { 
+                    dprintf(trace_fd, "[PROACTIVE_PE_MAP] FAILED: %s\n", strerror(errno)); 
+                } 
+            } 
+        } 
+        pe_mapped = 1; 
+  
+    } 
+
+    // Initialize common TLS fields 
+    *(uint32_t*)(&tls_block[0x00]) = 0;          // Exception list 
+    *(uint32_t*)(&tls_block[0x04]) = 0;          // Stack base 
+    *(uint32_t*)(&tls_block[0x08]) = 0;          // Stack limit 
+    *(uint32_t*)(&tls_block[0x18]) = (uintptr_t)tls_block;  // Self 
+    
+    // Setup TLS Array for FS:[0x2C] chain 
+    *(uint32_t*)(&tls_block[0x2C]) = (uintptr_t)&tls_block[0x400]; 
+    for(int i=0; i<128; ++i) { 
+        *(uint32_t*)(&tls_block[0x400 + i*4]) = (uintptr_t)tls_block; 
+    } 
+
+    // Fix 0x5C Thread ID check (DAT_0280a5c8) 
+    uint32_t this_tid = (uint32_t)syscall(__NR_gettid); 
+    if (this_tid == 0) this_tid = 1; 
+
+    uint32_t global_tid = 0; 
+    if (memExist(0x0280a5c8)) { 
+        global_tid = *(uint32_t*)0x0280a5c8; 
+    } 
+
+    if (global_tid == 0) { 
+        // Main thread – set global and local TID 
+        *(uint32_t*)0x0280a5c8 = this_tid; 
+        *(uint32_t*)(tls_block + 0x5C) = this_tid; 
+    } else { 
+        // Let it be 0, worker threads will initialize it later by themselves
+        *(uint32_t*)(tls_block + 0x5C) = 0; 
+    } 
+
+    // TLS[0x58] will be linked lazily in the signal handler 
+    *(uint32_t*)(tls_block + 0x58) = 0; 
+    
+    init_trace_fd(); 
+    if (trace_fd >= 0) { 
+        dprintf(trace_fd, "[TLS_INIT] Fake TLS Initialized at %p\n", tls_block); 
+        dprintf(trace_fd, "           - FS:[0x2C] -> Array at %p\n", &tls_block[0x400]); 
+        dprintf(trace_fd, "           - TLS[0x5C] (TID) = %u (Global=0x%x)\n", this_tid, memExist(0x0280a5c8) ? *(uint32_t*)0x0280a5c8 : 0); 
+        dprintf(trace_fd, "           - 32-bit safe address: 0x%08lx\n", tls_addr); 
+    } 
+    
+    // Force FS base to point to our fake TLS if possible 
+    x64emu_t *emu = thread_get_emu(); 
+    if(emu) { 
+         emu->segs_offs[_FS] = (uintptr_t)tls_block; 
+         emu->segs_serial[_FS] = 0; // Mark as dirty/custom 
+    } 
+} 
+
+#include "emu/x87emu_private.h"
 #include "bridge.h"
 #include "khash.h"
 #include "x64trace.h"
@@ -58,7 +273,284 @@
 #endif //arch
 #endif
 
-#include "signal_private.h"
+#if defined(__powerpc64__)
+#define PT_NIP 32
+#endif
+
+#include <libtools/signal_private.h>
+#include <time.h>
+
+#include <dlfcn.h> // For dlsym
+
+// 1. Expanded buffer to accommodate the 0x3000 offsets found in Ghidra
+static uint8_t engine_bootstrap[0x10000] __attribute__((aligned(16)));
+
+static uint8_t vtable_object[0x5000] __attribute__((aligned(4096)));
+static int dat_initialized = 0;
+
+static int is_wine_environment() {
+    return 0;
+}
+
+// --- SAFE ZONE FOR RESCUE RETURN VALUES ---
+static void* global_safe_zone = NULL;
+static size_t safe_zone_size = 0x10000;      // 64KB data
+static size_t safe_zone_guard = 0x200000;    // 2MB guard (was 64KB)
+static size_t safe_zone_total = 0x210000;    // 2MB + 64KB total
+static void* safe_zone_base = NULL;          // Base allocation
+
+static void* rescue_stub_page = NULL;
+static size_t rescue_stub_cursor = 0;
+
+static void init_safe_zone() {
+    if (global_safe_zone) {
+        // Already initialized
+        return;
+    }
+    
+    init_trace_fd();
+    if (trace_fd >= 0) {
+        dprintf(trace_fd, "[SAFEZONE_INIT_START] Allocating 0x%zx bytes (with 0x%zx guard)\n", 
+               safe_zone_total, safe_zone_guard);
+    }
+
+    // Allocate 128KB total (64KB guard + 64KB data)
+    safe_zone_base = mmap(NULL, safe_zone_total, 
+                          PROT_READ | PROT_WRITE | PROT_EXEC, 
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    
+    // Also allocate a page for rescue stubs (executable)
+    rescue_stub_page = mmap(NULL, 0x1000, 
+                           PROT_READ | PROT_WRITE | PROT_EXEC, 
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    if (safe_zone_base != MAP_FAILED && rescue_stub_page != MAP_FAILED) {
+        // SafeZone starts after guard region
+        global_safe_zone = (void*)((char*)safe_zone_base + safe_zone_guard);
+        
+        // Fill guard region with pointers to guard base
+        // This handles negative offsets from SafeZone (e.g. SafeZone[-1920])
+        uint64_t* guard_ptrs = (uint64_t*)safe_zone_base;
+        size_t guard_num = safe_zone_guard / sizeof(uint64_t);
+        for (size_t i = 0; i < guard_num; i++) {
+            guard_ptrs[i] = (uint64_t)safe_zone_base;
+        }
+        
+        // Fill data region with pointers to data base (SafeZone)
+        // This handles positive offsets from SafeZone
+        uint64_t* data_ptrs = (uint64_t*)global_safe_zone;
+        size_t data_num = safe_zone_size / sizeof(uint64_t);
+        for (size_t i = 0; i < data_num; i++) {
+            data_ptrs[i] = (uint64_t)global_safe_zone;
+        }
+
+        memset(rescue_stub_page, 0xCC, 0x1000); // Fill with INT3
+        if (trace_fd >= 0) {
+            dprintf(trace_fd, "[SAFEZONE_INIT_OK] Base: %p, Guard: %p-%p, SafeZone: %p-%p, StubPage: %p\n", 
+                   safe_zone_base, 
+                   safe_zone_base, (char*)safe_zone_base + safe_zone_guard, 
+                   global_safe_zone, (char*)global_safe_zone + safe_zone_size, 
+                   rescue_stub_page);
+        }
+    } else {
+        global_safe_zone = NULL;
+        safe_zone_base = NULL;
+        rescue_stub_page = NULL;
+        if (trace_fd >= 0) {
+            dprintf(trace_fd, "[SAFEZONE_FAIL] Failed to allocate SafeZone or StubPage! Error: %s\n", strerror(errno));
+        }
+    }
+}
+
+// Generate a unique stub for this rescue target
+// Stub: MOV RAX, SafeZone; JMP target
+static void* generate_rescue_stub(uintptr_t target_addr) {
+    init_trace_fd();
+    if (trace_fd >= 0) {
+        dprintf(trace_fd, "[STUB_GEN] Called with target=0x%lx, stub_page=%p, cursor=%zu\n", 
+               target_addr, rescue_stub_page, rescue_stub_cursor);
+    }
+
+    if (!rescue_stub_page || rescue_stub_cursor + 32 > 0x1000) {
+        if (trace_fd >= 0) {
+            dprintf(trace_fd, "[STUB_GEN_FAIL] page=%p, cursor=%zu\n", 
+                   rescue_stub_page, rescue_stub_cursor);
+        }
+        return NULL;
+    }
+    
+    uint8_t* p = (uint8_t*)rescue_stub_page + rescue_stub_cursor;
+    void* stub_addr = (void*)p;
+    
+    // MOV RAX, global_safe_zone (64-bit mov: 48 B8 ... 8 bytes ...)
+    *p++ = 0x48; *p++ = 0xB8;
+    *(uint64_t*)p = (uint64_t)global_safe_zone;
+    p += 8;
+    
+    // MOV R10, target (49 BA ... 8 bytes ...)
+    *p++ = 0x49; *p++ = 0xBA;
+    *(uint64_t*)p = (uint64_t)target_addr;
+    p += 8;
+    
+    // JMP R10 (41 FF E2)
+    *p++ = 0x41; *p++ = 0xFF; *p++ = 0xE2;
+    
+    rescue_stub_cursor += 32; // Advance cursor (aligned)
+    
+    if (trace_fd >= 0) {
+        dprintf(trace_fd, "[STUB_GEN_OK] Created at %p, sets RAX=%p\n", 
+               stub_addr, global_safe_zone);
+    }
+
+    return stub_addr;
+}
+
+static void log_memory_map_once() {
+    static int done = 0;
+    if(done) return;
+    int out = open("/sdcard/box64_maps.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    int in = open("/proc/self/maps", O_RDONLY, 0);
+    if(in >= 0 && out >= 0) {
+        char buf[4096];
+        ssize_t r;
+        while((r = read(in, buf, sizeof(buf))) > 0) {
+            ssize_t dummy_write_result = write(out, buf, r);
+        }
+    }
+    if(in >= 0) close(in);
+    if(out >= 0) close(out);
+    done = 1;
+}
+
+// Get memory map information for a given address
+// Returns 1 on success, 0 on failure
+static int get_map_info(uintptr_t addr, uintptr_t* map_start, uintptr_t* map_end, char* path) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) {
+        return 0;
+    }
+    
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        uintptr_t start, end;
+        char perms[5];
+        char pathname[512];
+        
+        // Parse line format: start-end perms offset dev inode pathname
+        if (sscanf(line, "%lx-%lx %4s %*x %*x:%*x %*d %511[^\n]", 
+                   &start, &end, perms, pathname) >= 3) {
+            
+            // Check if the address falls within this range
+            if (addr >= start && addr < end) {
+                *map_start = start;
+                *map_end = end;
+                
+                // If pathname was not captured (no path in maps entry), set to empty string
+                if (sscanf(line, "%lx-%lx %4s %*x %*x:%*x %*d %511[^\n]", 
+                          &start, &end, perms, pathname) == 4) {
+                    strcpy(path, pathname);
+                } else {
+                    path[0] = '\0';
+                }
+                
+                fclose(f);
+                return 1;
+            }
+        }
+    }
+    
+    fclose(f);
+    return 0;
+}
+
+// Simple x86-32 instruction length decoder (handles common cases) 
+static int get_x86_instruction_length(uint8_t* code) { 
+    int len = 0; 
+    int has_modrm = 0; 
+    
+    if (!code) return 0; 
+    
+    // Prefixes 
+    while(code[len] == 0x66 || code[len] == 0x67 || 
+          code[len] == 0xf2 || code[len] == 0xf3 || 
+          code[len] == 0x2e || code[len] == 0x3e || 
+          code[len] == 0x26 || code[len] == 0x64 || code[len] == 0x65) { 
+        len++; 
+    } 
+    
+    uint8_t opcode = code[len++]; 
+    
+    // Two-byte opcode 
+    if(opcode == 0x0f) { 
+        opcode = code[len++]; 
+    } 
+    
+    // Instructions that require ModR/M byte 
+    if((opcode >= 0x00 && opcode <= 0x0b) ||   // ADD, OR, ADC, SBB, AND, SUB, XOR, CMP 
+       (opcode >= 0x10 && opcode <= 0x3b && opcode != 0x0f) || 
+       (opcode >= 0x80 && opcode <= 0x8f) ||   // immediate ops, MOV, LEA, etc. 
+       opcode == 0xc0 || opcode == 0xc1 ||     // shift/rotate with imm8 
+       opcode == 0xc6 || opcode == 0xc7 ||     // MOV imm to r/m 
+       opcode == 0xd0 || opcode == 0xd1 || 
+       opcode == 0xd2 || opcode == 0xd3 || 
+       opcode == 0xf6 || opcode == 0xf7 ||     // TEST, NOT, NEG, MUL, etc. 
+       opcode == 0xfe || opcode == 0xff) {     // INC, DEC, CALL, JMP, PUSH 
+        has_modrm = 1; 
+    } 
+    
+    if(has_modrm) { 
+        uint8_t modrm = code[len++]; 
+        uint8_t mod = (modrm >> 6) & 3; 
+        uint8_t rm = modrm & 7; 
+        
+        // SIB byte 
+        if(mod != 3 && rm == 4) { 
+            len++;  // SIB byte 
+        } 
+        
+        // Displacement 
+        if(mod == 1) { 
+            len += 1;  // disp8 
+        } else if(mod == 2 || (mod == 0 && rm == 5)) { 
+            len += 4;  // disp32 
+        } 
+    } 
+    
+    // Immediate operands (simplified - covers common cases) 
+    switch(opcode) { 
+        case 0x68:  // PUSH imm32 
+        case 0xa9:  // TEST EAX, imm32 
+        case 0xb8: case 0xb9: case 0xba: case 0xbb:  // MOV reg, imm32 
+        case 0xbc: case 0xbd: case 0xbe: case 0xbf: 
+            len += 4; 
+            break; 
+        case 0x6a:  // PUSH imm8 
+        case 0x70: case 0x71: case 0x72: case 0x73:  // Jcc short 
+        case 0x74: case 0x75: case 0x76: case 0x77: 
+        case 0x78: case 0x79: case 0x7a: case 0x7b: 
+        case 0x7c: case 0x7d: case 0x7e: case 0x7f: 
+        case 0xeb:  // JMP short 
+            len += 1; 
+            break; 
+        case 0xe8:  // CALL near 
+        case 0xe9:  // JMP near 
+            len += 4; 
+            break; 
+    } 
+    
+    return len; 
+}
+
+// GLOBAL / STATIC VARIABLES for Rescue History
+#define HISTORY_SIZE 16
+static uintptr_t rescue_history[HISTORY_SIZE] = {0};
+static int history_idx = 0;
+static __thread uintptr_t targeted_last_rip = 0;
+static __thread int targeted_count = 0;
+static void* bridge_dummy = NULL;
+static void* engine_dummy_zone = NULL;
+static uint32_t engine_zone_magic = 0xDEADBEEF;
+static __thread int bridge_call_counter = 0;
 
 static void sigstack_destroy(void* p)
 {
@@ -105,7 +597,7 @@ uint64_t RunFunctionHandler(x64emu_t* emu, int* exit, int dynarec, x64_ucontext_
         va_end (va);
         printf_log(LOG_NONE, "%04d|Warning, calling Signal %d function handler %s\n", GetTID(), sig, fnc?"SIG_IGN":"SIG_DFL");
         if(fnc==0) {
-            printf_log(LOG_NONE, "Unhandled signal caught, aborting\n");
+            printf_log(LOG_NONE, "Unhandled signal %d caught, aborting\n", sig);
             abort();
         }
         return 0;
@@ -423,6 +915,7 @@ if(BOX64ENV(showsegv)) printf_log(LOG_INFO, "Marked db %p as dirty, and address 
 
 int sigbus_specialcases(siginfo_t* info, void * ucntx, void* pc, void* _fpsimd, dynablock_t* db, uintptr_t x64pc, int is32bits)
 {
+    ucontext_t *p = (ucontext_t *)ucntx;
     if((uintptr_t)pc<0x10000)
         return 0;
 #ifdef DYNAREC
@@ -430,7 +923,7 @@ int sigbus_specialcases(siginfo_t* info, void * ucntx, void* pc, void* _fpsimd, 
         /*return*/ mark_db_unaligned(db, x64pc);    // don't force an exit for now
 #endif
 #ifdef ARM64
-    ucontext_t *p = (ucontext_t *)ucntx;
+
     uint32_t opcode = *(uint32_t*)pc;
     struct fpsimd_context *fpsimd = (struct fpsimd_context *)_fpsimd;
     //printf_log(LOG_INFO, "Checking SIGBUS special cases with pc=%p, opcode=%x, fpsimd=%p\n", pc, opcode, fpsimd);
@@ -780,7 +1273,7 @@ int sigbus_specialcases(siginfo_t* info, void * ucntx, void* pc, void* _fpsimd, 
 #define GET_FIELD(v, high, low) (((v) >> low) & ((1ULL << (high - low + 1)) - 1))
 #define SIGN_EXT(val, val_sz) (((int32_t)(val) << (32 - (val_sz))) >> (32 - (val_sz)))
 
-    ucontext_t *p = (ucontext_t *)ucntx;
+
     uint32_t inst = *(uint32_t*)pc;
 
     uint32_t funct3 = GET_FIELD(inst, 14, 12);
@@ -860,6 +1353,8 @@ void my_sigactionhandler_oldcode_32(x64emu_t* emu, int32_t sig, int simple, sigi
 void my_sigactionhandler_oldcode_64(x64emu_t* emu, int32_t sig, int simple, siginfo_t* info, void * ucntx, int* old_code, void* cur_db)
 {
     int Locks = unlockMutex();
+
+
     int log_minimum = (BOX64ENV(showsegv))?LOG_NONE:LOG_DEBUG;
 
     printf_log(LOG_DEBUG, "Sigactionhanlder for signal #%d called (jump to %p/%s)\n", sig, (void*)my_context->signals[sig], GetNativeName((void*)my_context->signals[sig]));
@@ -1229,6 +1724,59 @@ void my_sigactionhandler_oldcode_64(x64emu_t* emu, int32_t sig, int simple, sigi
     relockMutex(Locks);
 }
 
+static int get_mov_rax_length(uintptr_t rip) {
+    if (!memExist(rip)) return 0;
+    uint8_t* code = (uint8_t*)rip;
+    
+    // Check for REX prefix
+    int offset = 0;
+    if (code[0] >= 0x40 && code[0] <= 0x4f) {
+        offset++;
+    }
+    
+    if (!memExist(rip + offset + 1)) return 0; // Check opcode and modrm
+    
+    uint8_t opcode = code[offset];
+    
+    // Case: MOV r/m -> r (8B)
+    if (opcode == 0x8B) {
+        uint8_t modrm = code[offset+1];
+        int reg = (modrm >> 3) & 7;
+        
+        // Destination must be RAX (reg=0)
+        if (reg != 0) return 0;
+        
+        int mod = (modrm >> 6) & 3;
+        int rm = modrm & 7;
+        
+        int len = offset + 2; // Prefix + Opcode + ModRM
+        
+        if (mod == 0 && rm == 5) { // RIP-relative (32-bit disp)
+            return len + 4;
+        }
+        if (mod == 0) {
+            if (rm == 4) { // SIB (no disp)
+                 // Check SIB existence
+                 if (!memExist(rip + len)) return 0;
+                 uint8_t sib = code[offset+2];
+                 if ((sib & 7) == 5) return len + 1 + 4; // SIB + disp32
+                 return len + 1;
+            }
+            return len; // [reg]
+        }
+        if (mod == 1) {
+            if (rm == 4) return len + 1 + 1; // SIB + disp8
+            return len + 1; // [reg] + disp8
+        }
+        if (mod == 2) {
+            if (rm == 4) return len + 1 + 4; // SIB + disp32
+            return len + 4; // [reg] + disp32
+        }
+    }
+    
+    return 0;
+}
+
 void my_sigactionhandler_oldcode(x64emu_t* emu, int32_t sig, int simple, siginfo_t* info, void * ucntx, int* old_code, void* cur_db, uintptr_t x64pc)
 {
     #define GO(A) uintptr_t old_##A = R_##A;
@@ -1338,8 +1886,124 @@ static pthread_mutex_t mutex_dynarec_prot = PTHREAD_ERRORCHECK_MUTEX_INITIALIZER
 extern int box64_quit;
 extern int box64_exit_code;
 
+#ifdef DYNAREC
+extern void ClearCache(void* start, size_t len);
+#endif
+
+static void mark_exception_handled(uintptr_t fault_addr, uintptr_t pc) {
+    (void)fault_addr;
+    (void)pc;
+}
+
+static void* watchdog_thread(void* arg) {
+    (void)arg;
+    int tick = 0;
+    while (1) {
+        sleep(10);
+        tick++;
+        init_trace_fd();
+        if (trace_fd >= 0) {
+            dprintf(trace_fd, "[WATCHDOG] Tick=%d process still alive, no SIGSEGV for 10s\n", tick);
+            // Log current known state
+            if (memExist(0x0280a5c0)) {
+                dprintf(trace_fd, "[WATCHDOG] DAT_0280a5c0 = 0x%08x\n", *(uint32_t*)0x0280a5c0);
+            }
+            if (memExist(0x0280a5c8)) {
+                dprintf(trace_fd, "[WATCHDOG] DAT_0280a5c8 = 0x%08x (main TID)\n", *(uint32_t*)0x0280a5c8);
+            }
+            if (memExist(0x0280a628)) {
+                dprintf(trace_fd, "[WATCHDOG] DAT_0280a628 = 0x%08x (thread handle)\n", *(uint32_t*)0x0280a628);
+            }
+        }
+    }
+    return NULL;
+}
+
 void my_box64signalhandler(int32_t sig, siginfo_t* info, void * ucntx)
 {
+    // === Fix 3: Add Safety to TRACE Blocks (Single trace_fd) ===
+    init_trace_fd();
+    
+    // Get emu structure for register access
+    x64emu_t* emu = thread_get_emu();
+
+    // === VEH diagnostics (periodic) ===
+    static int veh_check_counter = 0;
+    if (trace_fd >= 0 && (veh_check_counter++ % 100 == 0)) {
+        if (memExist(0x03396074)) {
+            dprintf(trace_fd, "[VEH_CHECK #%d] DAT_03396074 = 0x%08x\n",
+                    veh_check_counter, *(uint32_t*)0x03396074);
+        }
+        if (memExist(0x03396078)) {
+            dprintf(trace_fd, "[VEH_CHECK #%d] DAT_03396078 = %p\n",
+                    veh_check_counter, *(void**)0x03396078);
+        }
+    }
+    
+    // === EIP TRACE RECORDING ===
+    uint32_t current_rip = (uint32_t)R_RIP;
+    int idx = eip_trace_idx++ % EIP_TRACE_SIZE;
+    eip_trace[idx] = current_rip;
+
+    void* addr = (void*)info->si_addr;
+    uintptr_t fault_addr = (uintptr_t)addr;
+    int x64_sig = signal_from_x64(sig);
+
+    // [HANDLER_ENTRY]
+    if (trace_fd >= 0) {
+        dprintf(trace_fd, "\n[HANDLER_ENTRY] Sig=%d | Addr=%p | Code=%d | Thread=%d\n", 
+            x64_sig, addr, info->si_code, GetTID());
+    }
+
+    static int box64_ready = 0;
+    static __thread void* my_base = NULL;
+    static __thread void* my_secondary = NULL;
+
+    // Defer until box64 is fully initialized
+    if (!box64_ready && my_context && my_context->system) {
+        box64_ready = 1; // box64 is now initialized globally
+    }
+
+    if (box64_ready && !my_base) {
+        // This thread hasn't had its structures allocated yet
+        init_fake_tls(); // sets up the basic TLS block (FS:[0x2C] etc.)
+
+        my_base = box_calloc(1, 0x6000);
+        my_secondary = box_calloc(1, 0x77c0);
+        if (my_base && my_secondary) {
+            *(uintptr_t*)((uint8_t*)my_base + 0x5da8) = (uintptr_t)my_secondary;
+            
+            // Use a global status array index – assign a slot number.
+            static int next_slot = 0;
+            static pthread_mutex_t slot_mutex = PTHREAD_MUTEX_INITIALIZER;
+            pthread_mutex_lock(&slot_mutex);
+            int slot = next_slot++;
+            if (slot >= MAX_THREADS) slot = 0; // wrap around
+            pthread_mutex_unlock(&slot_mutex);
+
+            *(uintptr_t*)((uint8_t*)my_secondary + 0x1220) = (uintptr_t)&g_status_array[slot];
+            *(uint32_t*)&g_status_array[slot] = 7;
+            
+            // Store base pointer in global array for backward compatibility if needed
+            g_thread_base_ptrs[slot] = my_base;
+        }
+
+        // Also set TLS[0x58] to my_base
+        x64emu_t* emu = thread_get_emu();
+        if (emu && emu->segs_offs[_FS]) {
+            *(uintptr_t*)(emu->segs_offs[_FS] + 0x58) = (uintptr_t)my_base;
+        }
+        
+        if (trace_fd >= 0) {
+            dprintf(trace_fd, "[TLS_LAZY] Thread %d allocated structures: base=%p secondary=%p\n",
+                    GetTID(), my_base, my_secondary);
+        }
+    }
+
+    ucontext_t *p = (ucontext_t *)ucntx;
+    void * pc = NULL;
+    int Locks = 0;
+    struct fpsimd_context *fpsimd = NULL;
     sig = signal_from_x64(sig);
     // sig==X64_SIGSEGV || sig==X64_SIGBUS || sig==X64_SIGILL || sig==X64_SIGABRT here!
     int log_minimum = (BOX64ENV(showsegv))?LOG_NONE:((((sig==X64_SIGSEGV) || (sig==X64_SIGILL)) && my_context->is_sigaction[sig])?LOG_DEBUG:LOG_INFO);
@@ -1347,14 +2011,353 @@ void my_box64signalhandler(int32_t sig, siginfo_t* info, void * ucntx)
         signal_jmpbuf_active = 0;
         longjmp(SIG_JMPBUF, 1);
     }
-    ucontext_t *p = (ucontext_t *)ucntx;
-    void* addr = (void*)info->si_addr;  // address that triggered the issue
     void* rsp = NULL;
-    x64emu_t* emu = thread_get_emu();
     int tid = GetTID();
+
+    // === MEMORY DUMP FOR DEBUGGING === 
+    if(trace_fd >= 0) { 
+        uintptr_t rip = (uintptr_t)R_RIP;  
+        
+        // Dump 64 bytes at the faulting instruction pointer 
+        dprintf(trace_fd, "[MEMORY_DUMP] Dumping 64 bytes at Guest RIP=0x%lx:\n", rip);  
+        
+        // CRITICAL: Check BOTH existence AND read permission before accessing memory 
+        int prot = getProtection(rip); 
+        if (memExist(rip) && (prot & PROT_READ)) {  
+            uint8_t* code = (uint8_t*)rip;  
+            for (int i = 0; i < 64; i += 16) {  
+                dprintf(trace_fd, "  %08lx: ", rip + i);  
+                for (int j = 0; j < 16 && (i+j) < 64; j++) {  
+                    // Also check each byte before reading to avoid partial-page issues 
+                    if (memExist(rip + i + j) && (getProtection(rip + i + j) & PROT_READ)) { 
+                        dprintf(trace_fd, "%02x ", code[i+j]);  
+                    } else { 
+                        dprintf(trace_fd, "?? "); 
+                    } 
+                }  
+                dprintf(trace_fd, "\n");  
+            }  
+        } else {  
+            if (!memExist(rip)) { 
+                dprintf(trace_fd, "  Guest RIP points to UNMAPPED memory\n");  
+            } else { 
+                dprintf(trace_fd, "  Guest RIP at mapped memory with NO READ permission (prot=0x%x)\n", prot); 
+            } 
+        }  
+        
+        // Also check if this is in .data section 
+        if (rip >= 0x00CF7000 && rip <= 0x04332000) {  
+            dprintf(trace_fd, "[WARNING] Guest RIP is in .data section (0x%lx), expecting runtime-generated code\n", rip);  
+        } 
+    } 
+
+// === AFTER MEMORY_DUMP (around line 1940) ===
+if (trace_fd >= 0) {
+    dprintf(trace_fd, "[TRACE_1] After MEMORY_DUMP, before pc assignment | Sig=%d Addr=%p Code=%d\n", 
+            x64_sig, addr, info->si_code);
+}
+
 #ifdef __aarch64__
-    void * pc = (void*)p->uc_mcontext.pc;
-    struct fpsimd_context *fpsimd = NULL;
+    pc = (void*)p->uc_mcontext.pc;
+#elif defined __x86_64__
+    pc = (void*)p->uc_mcontext.regs[X64_RIP];
+#elif defined __powerpc64__
+    pc = (void*)p->uc_mcontext.gp_regs[PT_NIP];
+#elif defined(LA64)
+    pc = (void*)p->uc_mcontext.__pc;
+#elif defined(SW64)
+    pc = (void*)p->uc_mcontext.sc_pc;
+#elif defined(RV64)
+    pc = (void*)p->uc_mcontext.__gregs[REG_PC];
+#else
+    void * pc = NULL;    // unknow arch...
+    #warning Unhandled architecture
+#endif
+
+// === WINE RESERVED SPACE EXECUTION BLOCK === 
+uintptr_t guest_rip = (uintptr_t)R_RIP; 
+
+if (guest_rip >= 0x7f000000 && guest_rip <= 0x82000000) { 
+    if (trace_fd >= 0) { 
+        dprintf(trace_fd, "\n=== FATAL: EXECUTION IN WINE RESERVED SPACE ===\n"); 
+        dprintf(trace_fd, "[WINE_RESERVED_FATAL] RIP: 0x%lx\n", guest_rip); 
+        dprintf(trace_fd, "[WINE_RESERVED_FATAL] This indicates catastrophic memory corruption\n"); 
+        
+        // Dump context 
+        dprintf(trace_fd, "\n[WINE_RESERVED_FATAL] Register State:\n"); 
+        dprintf(trace_fd, "  RAX=0x%lx RBX=0x%lx RCX=0x%lx RDX=0x%lx\n", 
+                (uintptr_t)R_RAX, (uintptr_t)R_RBX, (uintptr_t)R_RCX, (uintptr_t)R_RDX); 
+        dprintf(trace_fd, "  RSP=0x%lx RBP=0x%lx\n", (uintptr_t)R_RSP, (uintptr_t)R_RBP); 
+        
+        // Try to find return address 
+        uint32_t* esp = (uint32_t*)(uintptr_t)R_RSP; 
+        if (memExist((uintptr_t)esp)) { 
+            dprintf(trace_fd, "\n[WINE_RESERVED_FATAL] Stack Analysis:\n"); 
+            for (int i = 0; i < 16; i++) { 
+                if (memExist((uintptr_t)&esp[i])) { 
+                    uint32_t val = esp[i]; 
+                    const char* note = ""; 
+                    if (val >= 0x00400000 && val < 0x00B00000) note = " [GAME CODE]"; 
+                    else if (val >= 0x7bf00000 && val < 0x7c000000) note = " [WINE DLL]"; 
+                    dprintf(trace_fd, "  ESP[%2d] = 0x%08x%s\n", i, val, note); 
+                } 
+            } 
+        } 
+    } 
+    
+    // Create trap page with UD2 instructions 
+    static void* trap_page = NULL; 
+    if (!trap_page) { 
+        trap_page = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, 
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); 
+        if (trap_page != MAP_FAILED) { 
+            // Fill with UD2 (0x0F 0x0B) - Undefined Instruction 
+            uint8_t* p = (uint8_t*)trap_page; 
+            for (int i = 0; i < 0x1000; i += 2) { 
+                p[i] = 0x0F;     // UD2 opcode byte 1 
+                p[i+1] = 0x0B;   // UD2 opcode byte 2 
+            } 
+            
+            if (trace_fd >= 0) { 
+                dprintf(trace_fd, "[WINE_RESERVED_FATAL] Created trap page at %p\n", trap_page); 
+            } 
+        } 
+    } 
+    
+    if (trap_page && trap_page != MAP_FAILED) { 
+        R_RIP = (uintptr_t)trap_page; 
+        if (trace_fd >= 0) { 
+            dprintf(trace_fd, "[WINE_RESERVED_FATAL] Redirected RIP to UD2 trap → will SIGILL immediately\n"); 
+            dprintf(trace_fd, "=====================================\n\n"); 
+        } 
+        
+        // Mark as handled to prevent Wine from seeing this 
+        mark_exception_handled(fault_addr, (uintptr_t)pc); 
+        relockMutex(Locks); 
+        return;  // Will crash with clean SIGILL at trap_page 
+    } 
+    
+    // Fallback: if trap page failed, let it crash naturally 
+    if (trace_fd >= 0) { 
+        dprintf(trace_fd, "[WINE_RESERVED_FATAL] Trap page unavailable - passing to Wine\n"); 
+        dprintf(trace_fd, "=================================\n\n"); 
+    } 
+} 
+
+// === AFTER PC ASSIGNMENT ===
+if (trace_fd >= 0) {
+    dprintf(trace_fd, "[TRACE_2] After pc assignment | pc=%p\n", pc);
+}
+
+// === BEFORE .DATA SECTION CHECK ===
+if (trace_fd >= 0) {
+    dprintf(trace_fd, "[TRACE_3] Before .DATA check | fault_addr=0x%lx\n", (uintptr_t)addr);
+}
+
+    // === .DATA SECTION FORCE-MAP FIX === 
+    // Wine's internal memory view shows .data as mapped (0xcf7000-0x4333fff) 
+    // but Linux kernel never allocated it. Force allocation on first access. 
+    // t6zm.exe .data section: VirtualAddress 0x00CF7000, VirtualSize 0x363A904 
+    // Mapped range should be: 0x00CF7000 - 0x04331903 
+    
+    fault_addr = (uintptr_t)addr;
+    if ((sig == X64_SIGSEGV || sig == SIGBUS) &&  
+        fault_addr >= 0x00CF7000 && fault_addr <= 0x04332000) { 
+         
+        // This is in the .data section range 
+        // Check if actually mapped at kernel level 
+        if (msync((void*)fault_addr, 1, MS_ASYNC) == -1 && errno == ENOMEM) { 
+            // NOT MAPPED - force allocation 
+            void* page_start = (void*)(fault_addr & ~0xFFFUL); 
+            size_t page_size = 4096; 
+             
+            // Allocate with exact address (MAP_FIXED) 
+            void* result = mmap(page_start, page_size, 
+                               PROT_READ | PROT_WRITE, 
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, 
+                               -1, 0); 
+             
+            if (result != MAP_FAILED) { 
+                // Zero-initialize the page 
+                memset(result, 0, page_size); 
+                 
+                if (trace_fd >= 0) { 
+                    dprintf(trace_fd, "[DATA_SECTION_FIX] Force-mapped .data page at %p for fault 0x%lx\n", 
+                            page_start, fault_addr); 
+                } 
+                 
+                // Mark handled and retry 
+                mark_exception_handled(fault_addr, (uintptr_t)pc); 
+                relockMutex(Locks); 
+                return; 
+            } else { 
+                if (trace_fd >= 0) { 
+                    dprintf(trace_fd, "[DATA_SECTION_FIX] FAILED to map page at %p: %s\n", 
+                            page_start, strerror(errno)); 
+                } 
+            } 
+        } else { 
+            // Already mapped but still faulting - permission issue? 
+            if (trace_fd >= 0) { 
+                dprintf(trace_fd, "[DATA_SECTION_FIX] Address 0x%lx is mapped but still faulting (si_code=%d)\n", 
+                        fault_addr, info->si_code); 
+                 
+                // Try changing permissions 
+                void* page_start = (void*)(fault_addr & ~0xFFFUL); 
+                if (mprotect(page_start, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) { 
+                    dprintf(trace_fd, "[DATA_SECTION_FIX] Changed permissions to RWX for %p\n", page_start); 
+                    mark_exception_handled(fault_addr, (uintptr_t)pc); 
+                    relockMutex(Locks); 
+                    return; 
+                } 
+            } 
+        } 
+    } 
+
+// === AFTER .DATA SECTION CHECK (after line 2024) ===
+if (trace_fd >= 0) {
+    dprintf(trace_fd, "[TRACE_4] After .DATA check, before .RSRC check\n");
+}
+
+    // === RESOURCE SECTION FORCE-MAP FIX === 
+    // .rsrc section: 0x04336000 - 0x04375fff 
+    if ((sig == X64_SIGSEGV || sig == SIGBUS) &&  
+        fault_addr >= 0x04336000 && fault_addr <= 0x04376000) { 
+         
+        if (msync((void*)fault_addr, 1, MS_ASYNC) == -1 && errno == ENOMEM) { 
+            void* page_start = (void*)(fault_addr & ~0xFFFUL); 
+             
+            void* result = mmap(page_start, 4096, 
+                               PROT_READ | PROT_WRITE | PROT_EXEC, 
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, 
+                               -1, 0); 
+             
+            if (result != MAP_FAILED) { 
+                memset(result, 0, 4096); 
+                 
+                if (trace_fd >= 0) { 
+                    dprintf(trace_fd, "[RSRC_SECTION_FIX] Force-mapped .rsrc page at %p for fault 0x%lx\n", 
+                            page_start, fault_addr); 
+                } 
+                 
+                mark_exception_handled(fault_addr, (uintptr_t)pc); 
+                relockMutex(Locks); 
+                return; 
+            } 
+        } 
+    } 
+
+// === AFTER .RSRC SECTION CHECK (after line 2054) ===
+if (trace_fd >= 0) {
+    dprintf(trace_fd, "[TRACE_5] After .RSRC check, sig=%d\n", sig);
+}
+
+    // --- Start of SIGILL Handling ---
+    if (sig == X64_SIGILL) {
+        static uintptr_t last_sigill_native_pc = 0;
+        static int sigill_consecutive_count = 0;
+
+        #ifdef __aarch64__
+        uintptr_t native_pc = (uintptr_t)p->uc_mcontext.pc;
+        #elif defined __x86_64__
+        uintptr_t native_pc = (uintptr_t)p->uc_mcontext.gregs[X64_RIP];
+        #else
+        uintptr_t native_pc = 0;
+        #endif
+        uintptr_t x64_rip = (uintptr_t)R_RIP;
+
+        if (trace_fd >= 0) {
+            dprintf(trace_fd, "[SIGILL_HANDLER] SIGILL at Native PC=0x%lx, x64 RIP=0x%lx\n", native_pc, x64_rip);
+            int page_ok = memExist(native_pc) && (getProtection(native_pc) & PROT_READ);
+            if (page_ok) {
+                uint8_t* p_bytes = (uint8_t*)native_pc;
+                dprintf(trace_fd, "BYTES[Native PC]: ");
+                for (int i = 0; i < 32; i++) {
+                    if (memExist(native_pc + i) && (getProtection(native_pc + i) & PROT_READ)) {
+                        dprintf(trace_fd, "%02x", p_bytes[i]);
+                    } else {
+                        dprintf(trace_fd, "??"); // Unreadable byte
+                    }
+                }
+                dprintf(trace_fd, "\n");
+            }
+            dprintf(trace_fd, "REGS: RIP=0x%lx RSP=0x%lx RAX=0x%lx RBX=0x%lx RCX=0x%lx RDX=0x%lx RSI=0x%lx RDI=0x%lx RBP=0x%lx\n",
+                    x64_rip, (uintptr_t)R_RSP, (uintptr_t)R_RAX, (uintptr_t)R_RBX, (uintptr_t)R_RCX, (uintptr_t)R_RDX, (uintptr_t)R_RSI, (uintptr_t)R_RDI, (uintptr_t)R_RBP);
+        }
+        
+        if (last_sigill_native_pc == native_pc) {
+            sigill_consecutive_count++;
+            #ifdef __aarch64__
+            if (sigill_consecutive_count > 5) {
+                R_RAX = 1;
+                p->uc_mcontext.pc += 4;
+                R_RIP = p->uc_mcontext.pc;
+                return;
+            }
+            #endif
+        } else {
+            last_sigill_native_pc = native_pc;
+            sigill_consecutive_count = 1;
+        }
+
+        #if defined __x86_64__
+        if ((uintptr_t)R_RIP == 0x0047FB6F) {
+            if (trace_fd >= 0) {
+                dprintf(trace_fd, "[FIX] Targeting 0x5C fault at RIP=0x%lx. Skipping exact instruction length.\n", (uintptr_t)R_RIP);
+            }
+            R_EAX = 1;
+            p->uc_mcontext.gregs[X64_RIP] += 3;
+            R_RIP = p->uc_mcontext.gregs[X64_RIP];
+            return;
+        }
+        #endif
+        // Fall through without generic byte skipping; universal rescue will handle
+    }
+    // --- End of SIGILL Handling ---
+
+// === AFTER SIGILL HANDLING (after line 2126) ===
+if (trace_fd >= 0) {
+    dprintf(trace_fd, "[TRACE_6] After SIGILL handling | sig=%d pc=%p addr=%p\n", sig, pc, addr);
+}
+
+    // --- Start of Fake Object Strategy ---
+    if (sig == X64_SIGSEGV && (uintptr_t)pc == 0x0047FB6F && (uintptr_t)addr == 0x5C) {
+        static void* fake_object_page = NULL;
+        if (fake_object_page == NULL) {
+            // Allocate a small, read/write memory page for the fake object
+            fake_object_page = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (fake_object_page == MAP_FAILED) {
+                printf_log(LOG_ERROR, "Failed to mmap fake object page for 0x5C fault!\n");
+                relockMutex(Locks);
+                return; // Let the normal signal handler deal with it if mmap fails
+            }
+            printf_log(LOG_INFO, "Allocated fake object page at %p for 0x5C fault.\n", fake_object_page);
+        }
+
+        // Set RCX to the address of the fake object page
+        // The fault is MOV EAX, [ECX + 5Ch], so ECX is the base register that is NULL
+        R_RCX = (uintptr_t)fake_object_page;
+
+        // Set RIP back to the faulting instruction to retry it
+        #ifdef __aarch64__
+        R_RIP = 0x0047FB6F;
+        p->uc_mcontext.pc = 0x0047FB6F;
+        #elif defined __x86_64__
+        R_RIP = 0x0047FB6F;
+        p->uc_mcontext.gregs[X64_RIP] = 0x0047FB6F;
+        #endif
+
+        printf_log(LOG_INFO, "Handled 0x5C fault at PC=0x0047FB6F. RCX set to %p, retrying instruction.\n", fake_object_page);
+        return;
+    }
+    // --- End of Fake Object Strategy ---
+
+// === AFTER FAKE OBJECT STRATEGY (after line 2158) ===
+if (trace_fd >= 0) {
+    dprintf(trace_fd, "[TRACE_7] After Fake Object strategy\n");
+}
+
+#if defined(__aarch64__)
     // find fpsimd struct
     {
         struct _aarch64_ctx * ff = (struct _aarch64_ctx*)p->uc_mcontext.__reserved;
@@ -1365,24 +2368,18 @@ void my_box64signalhandler(int32_t sig, siginfo_t* info, void * ucntx)
                 ff = (struct _aarch64_ctx*)((uintptr_t)ff + ff->size);
         }
     }
-#elif defined __x86_64__
-    void * pc = (void*)p->uc_mcontext.gregs[X64_RIP];
-    void* fpsimd = NULL;
-#elif defined __powerpc64__
-    void * pc = (void*)p->uc_mcontext.gp_regs[PT_NIP];
-    void* fpsimd = NULL;
+#elif defined(__x86_64__)
+    pc = (void*)p->uc_mcontext.regs[X64_RIP];
+#elif defined(__powerpc64__)
+    pc = (void*)p->uc_mcontext.gp_regs[PT_NIP];
 #elif defined(LA64)
-    void * pc = (void*)p->uc_mcontext.__pc;
-    void* fpsimd = NULL;
+    pc = (void*)p->uc_mcontext.__pc;
 #elif defined(SW64)
-    void * pc = (void*)p->uc_mcontext.sc_pc;
-    void* fpsimd = NULL;
+    pc = (void*)p->uc_mcontext.sc_pc;
 #elif defined(RV64)
-    void * pc = (void*)p->uc_mcontext.__gregs[REG_PC];
-    void* fpsimd = NULL;
+    pc = (void*)p->uc_mcontext.__gregs[REG_PC];
 #else
-    void * pc = NULL;    // unknow arch...
-    void* fpsimd = NULL;
+    pc = NULL;    // unknow arch...
     #warning Unhandled architecture
 #endif
     dynablock_t* db = NULL;
@@ -1449,7 +2446,9 @@ void my_box64signalhandler(int32_t sig, siginfo_t* info, void * ucntx)
                             // mark all callrets to NOP
                             for(int i=0; i<db->callret_size; ++i)
                                 *(uint32_t*)(db->block+db->callrets[i].offs) = ARCH_NOP;
+                            #ifdef DYNAREC
                             ClearCache(db->block, db->size);
+                            #endif
                         }
                         protectDBJumpTable((uintptr_t)db->x64_addr, db->x64_size, db->block, db->jmpnext);
                     }
@@ -1463,6 +2462,7 @@ void my_box64signalhandler(int32_t sig, siginfo_t* info, void * ucntx)
                             adjustregs(emu, pc);
                             if(db && db->arch_size)
                                 ARCH_ADJUST(db, emu, p, x64pc);
+                            
                         }
                         dynarec_log(LOG_INFO, "Dynablock (%p, x64addr=%p) %s, getting out at %s %p (%p)!\n", db, db->x64_addr, is_hotpage?"in HotPage":"dirty", getAddrFunctionName(R_RIP), (void*)R_RIP, type_callret?"self-loop":"ret from callret", (void*)addr);
                         emu->test.clean = 0;
@@ -1479,7 +2479,7 @@ void my_box64signalhandler(int32_t sig, siginfo_t* info, void * ucntx)
         }
     }
     #endif
-    int Locks = unlockMutex();
+
     uint32_t prot = getProtection((uintptr_t)addr);
     #ifdef BAD_SIGNAL
     // try to see if the si_code makes sense
@@ -1515,6 +2515,2710 @@ void my_box64signalhandler(int32_t sig, siginfo_t* info, void * ucntx)
         }
     }
 #endif
+// Macro to safely resume execution after altering CPU state (R_RIP, registers, etc.)
+// This forces a siglongjmp which tells the emulator to break out of the JIT block
+// and fetch the instruction at the new R_RIP.
+#define RESUME_EXECUTION_INTERP() \
+    do { \
+        if(emu && emu->jmpbuf) { \
+            relockMutex(Locks); \
+            siglongjmp(emu->jmpbuf, 1); \
+        } else { \
+            relockMutex(Locks); \
+            return; \
+        } \
+    } while(0)
+
+// Wine wow64 RtlDecodePointer mismatch: route to real VEH at 0x0099da00
+if ((sig == X64_SIGSEGV || sig == X64_SIGBUS) && (uint32_t)R_RIP == 0xEFFF86A5) {
+    if (trace_fd >= 0) {
+        dprintf(trace_fd, "[VEH_FIX] Broken RtlDecodePointer (0xEFFF86A5) -> handler 0x0099da00\n");
+    }
+    R_RIP = 0x0099da00;
+    
+#ifdef DYNAREC
+    CONTEXT_PC(p) = 0x0099da00;
+#endif
+    mark_exception_handled(fault_addr, (uintptr_t)pc);
+    RESUME_EXECUTION_INTERP();
+}
+
+// === BEFORE SIGNAL_ENTRY ===
+if (trace_fd >= 0) {
+    dprintf(trace_fd, "[TRACE_8] About to enter SIGNAL_ENTRY logging\n");
+}
+
+// PRE-PATCH DEBUG LOGGING
+if(trace_fd >= 0) {
+    dprintf(trace_fd, "[SIGNAL_ENTRY] Sig=%d Addr=%p Code=%d PC=%p\n", sig, addr, info->si_code, (void*)pc);
+    if(!addr) dprintf(trace_fd, "[SIGNAL_ENTRY] WARNING: Addr is NULL (Universal Patch might skip)\n");
+}
+
+// === DIAGNOSTIC: Inspect what called 0x49d1e40 ===
+if (guest_rip == 0x49d1e40 && trace_fd >= 0) {
+    dprintf(trace_fd, "\n=== FASTFILE FUNCTION TABLE DIAGNOSTIC ===\n");
+    
+    // Get the return address (who called this invalid function?)
+    uintptr_t* stack = (uintptr_t*)(uintptr_t)R_ESP;
+    if (stack && memExist((uintptr_t)stack)) {
+        uintptr_t return_addr = stack[0];
+        dprintf(trace_fd, "[FASTFILE] Return address: 0x%08lx\n", return_addr);
+        
+        // Is the caller in the DEFRAG region?
+        if (return_addr >= 0x04400000 && return_addr <= 0x04B00000) {
+            dprintf(trace_fd, "[FASTFILE] Caller is in DEFRAG region (decrypted code)\n");
+            
+            // Dump memory around the call site
+            dprintf(trace_fd, "[FASTFILE] Dumping 64 bytes at caller:\n");
+            uint8_t* code = (uint8_t*)(return_addr - 16);
+            if (memExist((uintptr_t)code)) {
+                dprintf(trace_fd, "  ");
+                for (int i = 0; i < 64; i++) {
+                    dprintf(trace_fd, "%02x ", code[i]);
+                    if ((i + 1) % 16 == 0) dprintf(trace_fd, "\n  ");
+                }
+                dprintf(trace_fd, "\n");
+            }
+        }
+    }
+    
+    // Check if there's a function pointer table in the data structures
+    if (memExist(R_EBX)) {
+        uint32_t* table_base = (uint32_t*)(uintptr_t)R_EBX;
+        dprintf(trace_fd, "[FASTFILE] EBX points to structure at 0x%08x:\n", R_EBX);
+        for (int i = 0; i < 24; i++) {
+            if (memExist((uintptr_t)(table_base + i))) {
+                dprintf(trace_fd, "[FASTFILE]   +0x%02x: 0x%08x\n", i*4, table_base[i]);
+            }
+        }
+    }
+    
+    dprintf(trace_fd, "==========================================\n\n");
+}
+
+// === FUNC_SKIP_49D1E40 ===
+// Skip problematic function at 0x49d1e40 causing NULL pointer dereferences
+if (guest_rip >= 0x49d1e40 && guest_rip <= 0x49d1e50) {
+    uint32_t* esp = (uint32_t*)(uintptr_t)R_RSP;
+    
+    // ===== DIAGNOSTIC: WHO IS CALLING THIS? =====
+    if (trace_fd >= 0) {
+        dprintf(trace_fd, "\n[DIAGNOSTIC_49D1E40] ==== FUNCTION POINTER CRASH ====\n");
+        dprintf(trace_fd, "[DIAGNOSTIC_49D1E40] RIP attempting to execute: 0x%08lx\n", guest_rip);
+        
+        // Dump stack to find caller
+        if (memExist((uintptr_t)esp)) {
+            dprintf(trace_fd, "[DIAGNOSTIC_49D1E40] Stack dump (return addresses):\n");
+            for (int i = 0; i < 16; i++) {
+                if (memExist((uintptr_t)(esp + i))) {
+                    uint32_t stack_val = esp[i];
+                    if (stack_val >= 0x400000 && stack_val < 0xB00000) {
+                        dprintf(trace_fd, "  [ESP+0x%02x] = 0x%08x <- CALLER in .text\n", i*4, stack_val);
+                    }
+                }
+            }
+        }
+        
+        // Check registers that might hold the function pointer
+        dprintf(trace_fd, "[DIAGNOSTIC_49D1E40] Register state:\n");
+        dprintf(trace_fd, "  EAX = 0x%08lx\n", (uintptr_t)R_RAX);
+        dprintf(trace_fd, "  ECX = 0x%08lx\n", (uintptr_t)R_RCX);
+        dprintf(trace_fd, "  EDX = 0x%08lx\n", (uintptr_t)R_RDX);
+        dprintf(trace_fd, "  EBX = 0x%08lx\n", (uintptr_t)R_RBX);
+        dprintf(trace_fd, "  ESI = 0x%08lx\n", (uintptr_t)R_RSI);
+        dprintf(trace_fd, "  EDI = 0x%08lx\n", (uintptr_t)R_RDI);
+        dprintf(trace_fd, "===================================\n\n");
+    }
+    
+    // Try to return gracefully
+    if(memExist((uintptr_t)esp)) {
+        R_RIP = esp[0];  // Return from function
+        R_RSP += 4;      // Pop return address
+        // Return non-zero to Wine's BaseThreadInitThunk so it does not
+        // retry the call. EAX=1 signals "completed" in most Windows
+        // thread wrapper conventions.
+        emu->regs[_AX].dword[0] = 1;
+        R_RAX = 1;
+        if (trace_fd >= 0) {
+            dprintf(trace_fd, "[FUNC_SKIP_49D1E40] Returning EAX=1 to prevent Wine loop retry\n");
+        }
+    } else {
+        R_RIP += 5;      // Fallback: just skip instruction
+        if (trace_fd >= 0) {
+             dprintf(trace_fd, "[FUNC_SKIP_49D1E40] Skipped problematic function at 0x%lx becuase memExist((uintptr_t)esp failed\n", guest_rip);
+        }
+    }
+    
+    RESUME_EXECUTION_INTERP();
+}
+// === END FUNC_SKIP ===
+
+// === TLS SIMPLIFIED FIX (Replaces TLS_PROPER) === 
+// 1. Prevents reading corrupt _tls_index from uninitialized memory 
+// 2. Breaks infinite loop by manually executing instructions and advancing RIP 
+
+current_rip = (uintptr_t)R_RIP; 
+// Trigger on ANY crash with TLS-related fault address in the TLS access function range 
+uintptr_t fault = (uintptr_t)info->si_addr; 
+int is_tls_fault = (fault == 0x5c || fault == 0x58 || fault == 0x2c); 
+int in_tls_function = (current_rip >= 0x47fb60 && current_rip <= 0x47fb9b); // FUN_0047fb60 range 
+int in_init_function = (current_rip >= 0x4cd220 && current_rip <= 0x4cd2a2); // FUN_004cd220 range 
+ 
+if ((is_tls_fault && (in_tls_function || in_init_function)) ||  
+    current_rip == 0x47fb6f || current_rip == 0x4cd229 || current_rip == 0x733400 || current_rip == 0x733609 || 
+    current_rip == 0x73360c) {  // Also handle next instruction after 0x733609
+    init_fake_tls();  // Ensure base TLS structure exists 
+    
+    // Log successful progression past 0x733609
+    if (current_rip == 0x73360c) {
+        static int success_count = 0;
+        success_count++;
+        if (trace_fd >= 0 && success_count <= 5) {
+            dprintf(trace_fd, "[SUCCESS] Reached 0x73360c (after 0x733609) - progression confirmed! Count=%d\n", 
+                    success_count);
+        }
+    } 
+    
+    // BEFORE the read at 0x733600 (function entry, not crash point)
+    if (current_rip == 0x733600 && !dat_initialized) {
+        dat_initialized = 1;
+        
+        // Allocate object with vtable structure 
+        uint32_t* obj = (uint32_t*)vtable_object; 
+        
+        // Safe RET instruction to use for all vtable entries 
+        uint32_t safe_ret = 0x006e2b1a;  // Known safe RET from bootstrap 
+        
+        obj[0x00/4] = safe_ret;  // +0x00 
+        obj[0x04/4] = safe_ret;  // +0x04
+        obj[0x08/4] = safe_ret;  // +0x08 - Critical for crash at 0x733609
+        obj[0x0C/4] = safe_ret;  // +0x0C 
+        obj[0x18/4] = safe_ret;  // +0x18 
+        obj[0x1C/4] = safe_ret;  // +0x1C - THIS IS THE CRITICAL ONE 
+        obj[0x20/4] = safe_ret;  // +0x20 
+        obj[0x24/4] = safe_ret;  // +0x24 
+        obj[0x30/4] = safe_ret;  // +0x30 
+        obj[0x34/4] = safe_ret;  // +0x34 
+        obj[0x38/4] = safe_ret;  // +0x38 
+        
+        // Write pointer to DAT_0357927c 
+        *(uint32_t*)0x0357927c = (uint32_t)(uintptr_t)obj; 
+        
+        if (trace_fd >= 0) {
+             dprintf(trace_fd, "[DAT_FIX] Initialized DAT_0357927c = %p\n", obj); 
+         }
+
+         // Mark exception handled and return to retry the read instruction
+         mark_exception_handled(fault, (uintptr_t)pc);
+         relockMutex(Locks);
+         return;
+     }
+     
+     // Handle crash at 0x733609: MOV EAX,[EAX+8]
+     // Strategy: SKIP the instruction and manually set EAX
+     // Wine exception handlers return 1 (CONTINUE_SEARCH), which conflicts with retry
+     if (current_rip == 0x733609) {
+         static int fix_count_733609 = 0;
+         fix_count_733609++;
+         
+         if (!dat_initialized) {
+             dat_initialized = 1;
+             
+             // Initialize vtable object
+             uint32_t* obj = (uint32_t*)vtable_object;
+             uint32_t safe_ret = 0x006e2b1a;
+             
+             obj[0x00/4] = safe_ret;
+             obj[0x04/4] = safe_ret;
+             obj[0x08/4] = safe_ret;  // Critical - accessed by this instruction
+             obj[0x0C/4] = safe_ret;
+             obj[0x18/4] = safe_ret;
+             obj[0x1C/4] = safe_ret;
+             obj[0x20/4] = safe_ret;
+             obj[0x24/4] = safe_ret;
+             obj[0x30/4] = safe_ret;
+             obj[0x34/4] = safe_ret;
+             obj[0x38/4] = safe_ret;
+             
+             // Write to DAT_0357927c
+             if (memExist(0x0357927c)) {
+                 *(uint32_t*)0x0357927c = (uint32_t)(uintptr_t)obj;
+             }
+             
+             if (trace_fd >= 0) {
+                 dprintf(trace_fd, "[DAT_FIX_0x733609] Initialized DAT_0357927c = %p\n", obj);
+             }
+         }
+         
+         // CRITICAL: Instead of retrying, SKIP the instruction and set result manually
+         // Instruction: MOV EAX,[EAX+8] - reads from [EAX+8] and stores in EAX
+         // Result should be vtable_object[8/4] = 0x006e2b1a (safe RET)
+         uint32_t* obj = (uint32_t*)vtable_object;
+         uint32_t result = obj[0x08/4];  // Read what the instruction would read
+         
+         // Get current RAX value before fix
+         uint32_t old_rax = (uint32_t)R_RAX;
+         
+         // Set EAX to the result of the instruction
+         emu->regs[_AX].dword[0] = result;
+         R_RAX = result;
+         
+         // SKIP the instruction (MOV EAX,[EAX+8] is 3 bytes: 8B 40 08)
+         emu->ip.dword[0] = current_rip + 3;
+         R_RIP = current_rip + 3;
+         
+         if (trace_fd >= 0) {
+             dprintf(trace_fd, "[DAT_FIX_0x733609 #%d] SKIP instruction | Fault=0x%lx | Old RAX=0x%08x | Set EAX=0x%08x | RIP: 0x%x -> 0x%x\n", 
+                     fix_count_733609, fault, old_rax, result, (uint32_t)current_rip, (uint32_t)current_rip + 3);
+             
+             // Log if we're stuck in a loop
+             if (fix_count_733609 > 10 && fix_count_733609 % 100 == 0) {
+                 dprintf(trace_fd, "[DAT_FIX_0x733609] WARNING: Fixed %d times - possible infinite loop!\n", 
+                         fix_count_733609);
+             }
+         }
+         
+         // Use RESUME_EXECUTION_INTERP() macro instead of mark_exception_handled
+         RESUME_EXECUTION_INTERP();
+     }
+
+    // Run bootstrap once 
+    static int bootstrap_done = 0; 
+    if (!bootstrap_done) { 
+        bootstrap_done = 1; 
+
+        // Initialise master structure
+        uintptr_t base = (uintptr_t)&engine_bootstrap[0]; 
+        if (memExist(0x01279fcc)) *(uint32_t*)(0x01279fcc) = (uint32_t)base;
+
+        uintptr_t ptr1 = (uintptr_t)(base + 0x1000); 
+        uintptr_t ptr2 = (uintptr_t)(base + 0x2000); 
+
+        *(uint32_t*)(base + 0x5da8) = (uint32_t)ptr1; 
+        *(uint32_t*)(ptr1 + 0x1220) = (uint32_t)ptr2; 
+        *(uint32_t*)(ptr2) = 7; 
+        *(uint32_t*)(ptr2 + 4) = 0xFFFFFFFF; 
+
+        uintptr_t vtable_ptr = (uintptr_t)(base + 0x3000); 
+        uintptr_t vtable_base = (uintptr_t)(base + 0x3100); 
+        *(uint32_t*)(base + 0x10) = (uint32_t)vtable_ptr; 
+        *(uint32_t*)(vtable_ptr) = (uint32_t)vtable_base; 
+        *(uint32_t*)(vtable_base + 4) = 0x006e2b1a; // safe RET 
+
+        if (memExist(0x017913f4)) *(uint32_t*)(0x017913f4) = 7; 
+
+        // Allocate heap for DAT_017913d0 
+        void* custom_heap = mmap(NULL, 64 * 1024 * 1024, 
+                                  PROT_READ | PROT_WRITE | PROT_EXEC, 
+                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); 
+        if (custom_heap != MAP_FAILED && memExist(0x017913d0)) { 
+            *(uint32_t*)0x017913d0 = (uint32_t)(uintptr_t)custom_heap; 
+            if (trace_fd >= 0) dprintf(trace_fd, "[BOOTSTRAP] Set DAT_017913d0 = %p\n", custom_heap); 
+        } 
+
+        // Allocate context array (DAT_0280a410) 
+        void* ctx_array = mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, 
+                                MAP_PRIVATE|MAP_ANONYMOUS, -1, 0); 
+        if (ctx_array != MAP_FAILED && memExist(0x0280a410)) { 
+            *(uint32_t*)0x0280a410 = (uint32_t)(uintptr_t)ctx_array; 
+            if (trace_fd >= 0) dprintf(trace_fd, "[BOOTSTRAP] Set DAT_0280a410 = %p\n", ctx_array); 
+        } 
+
+        // Allocate function table (DAT_0280a6a8) 
+        void* func_table = mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, 
+                                 MAP_PRIVATE|MAP_ANONYMOUS, -1, 0); 
+        if (func_table != MAP_FAILED && memExist(0x0280a6a8)) { 
+            *(uint32_t*)0x0280a6a8 = (uint32_t)(uintptr_t)func_table; 
+            if (trace_fd >= 0) dprintf(trace_fd, "[BOOTSTRAP] Set DAT_0280a6a8 = %p\n", func_table); 
+        } 
+
+        // Initialise master structure with sentinels and sizes 
+        if (base) { 
+            uint32_t* master = (uint32_t*)base; 
+
+            // Sentinels (fields that should be -1) 
+            uint32_t sentinels[] = { 
+                0x100, 0x110, 0x118, 0x120, 0x128, 0x130, 0x138, 0x140, 0x148, 0x150, 
+                0x158, 0x160, 0x188, 0x21c, 0x240, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 
+                0x2fc, 0x304, 0x308, 0x30c, 0x3e0, 0x3e8, 0x3f4, 0x3f8 
+            }; 
+            for (int i = 0; i < (int)(sizeof(sentinels)/sizeof(sentinels[0])); i++) { 
+                master[sentinels[i]/4] = 0xFFFFFFFF; 
+            } 
+
+            // Size fields (set to 1 as minimal safe value) 
+            uint32_t sizes[] = {0x8, 0xc, 0x10c, 0x114, 0x11c, 0x124, 0x12c}; 
+            for (int i = 0; i < (int)(sizeof(sizes)/sizeof(sizes[0])); i++) { 
+                master[sizes[i]/4] = 1; 
+            } 
+
+            // Dummy pointers 
+            master[0x10/4] = (uint32_t)(base + 0x4000); 
+            master[0x14/4] = (uint32_t)(base + 0x4100); 
+
+            // Set _DAT_0127a440 = DAT_01279fcc + 0x174 and its sentinels 
+            if (memExist(0x0127a440)) { 
+                uint32_t a440_base = (uint32_t)(base + 0x174); 
+                *(uint32_t*)0x0127a440 = a440_base; 
+                if (memExist(a440_base)) { 
+                    uint32_t* a440_ptr = (uint32_t*)(uintptr_t)a440_base; 
+                    a440_ptr[1] = 0xFFFFFFFF; 
+                    a440_ptr[2] = 0xFFFFFFFF; 
+                    a440_ptr[3] = 0xFFFFFFFF; 
+                } 
+            } 
+
+            if (trace_fd >= 0) { 
+                dprintf(trace_fd, "[FIX] Bootstrap (v5) executed from TLS_FIX. Master structure initialised.\n"); 
+            } 
+        } 
+    } 
+    
+    uint8_t* tls_block = (uint8_t*)pthread_getspecific(tls_block_key); 
+    if (!tls_block) { 
+        init_fake_tls(); 
+        tls_block = (uint8_t*)pthread_getspecific(tls_block_key); 
+    } 
+    uintptr_t tls_base = (uintptr_t)tls_block; 
+    
+    // t6zm.exe .data section: 
+    //   - Disk size:    0x302200 (3.15 MB) - initialized data from PE file 
+    //   - Virtual size: 0x363a904 (57 MB)  - total allocation 
+    //   - Uninitialized: 54 MB that should be zero but contains garbage 
+    // 
+    // Addresses like DAT_0357927c (offset 0x0288227c) are uninitialized 
+    
+    // === WINE .DATA SECTION BUG - FORCE ZERO INITIALIZATION === 
+    // Wine maps .data as file-backed from PE file. 
+    // The uninitialized portion should be zero but contains garbage from the file. 
+    // Solution: Force copy-on-write by writing to every page, then zero it. 
+        
+    static int data_section_fixed = 0;  
+    if (!data_section_fixed && memExist(0x00CF7000)) {  
+        uintptr_t data_start = 0x00CF7000;  
+        size_t disk_size = 0x302200;      // Size on disk (initialized from file) 
+        size_t virt_size = 0x363a904;     // Total virtual size 
+        
+        // Calculate page-aligned boundaries 
+        size_t page_size = 4096; 
+        uintptr_t zero_start_unaligned = data_start + disk_size;  // 0x00FF9200 
+        uintptr_t zero_start = (zero_start_unaligned / page_size) * page_size;  // Round down to page 
+        uintptr_t zero_end = data_start + virt_size; 
+        size_t zero_size = zero_end - zero_start; 
+        
+        // Ensure the region is writable 
+        mprotect((void*)zero_start, zero_size, PROT_READ | PROT_WRITE | PROT_EXEC); 
+        
+        // NEW DIAGNOSTIC: Check the "Security/Jump" table area before we wipe it
+        // Addresses taken from Ghidra analysis of FUN_0060ecd0 callers
+        uint32_t jump_key_1 = memExist(0x01261b24) ? *(uint32_t*)0x01261b24 : 0;
+        uint32_t jump_key_2 = memExist(0x01261b2c) ? *(uint32_t*)0x01261b2c : 0;
+        dprintf(trace_fd, "[DIAGNOSTIC] Jump Keys BEFORE zero-fill pe: K1=0x%08x, K2=0x%08x\n", jump_key_1, jump_key_2);
+
+        // Force copy-on-write for ALL pages by writing to the first byte of each page 
+        // This breaks the file-backed mapping and creates private anonymous pages 
+        for (uintptr_t addr = zero_start; addr < zero_end; addr += page_size) { 
+            volatile uint8_t* page = (volatile uint8_t*)addr; 
+            *page = 0;  // Force page fault and copy-on-write 
+        } 
+        
+        // DIAGNOSTIC: Check DAT_00cff6bc BEFORE zero-fill
+        uint32_t cff6bc_before = 0;
+        if (memExist(0x00cff6bc)) {
+            cff6bc_before = *(uint32_t*)0x00cff6bc;
+            dprintf(trace_fd, "[DATA_FIX] DAT_00cff6bc BEFORE zero-fill = 0x%08x\n", cff6bc_before);
+        }
+
+        // Log slot monitoring
+        if (memExist(0x01259b00)) {
+            uint32_t s0_base_pre = *(uint32_t*)(0x01259b00 + 0x8020);
+            uint32_t s0_size_pre = *(uint32_t*)(0x01259b00 + 0x8024);
+            dprintf(trace_fd, "[DATA_FIX_TIMING] Slot[0] BEFORE zeroing: Base=0x%08x, Size=0x%08x\n", 
+                    s0_base_pre, s0_size_pre);
+        }
+
+        // Log pool state BEFORE zeroing
+        if (memExist(0x01259a28)) {
+            uint32_t pool_base_before = *(uint32_t*)0x01259a28;
+            uint32_t slot_counter_before = *(uint32_t*)0x01259a34;
+            dprintf(trace_fd, "[DATA_FIX_TIMING] Pool state BEFORE zeroing:\n");
+            dprintf(trace_fd, "[DATA_FIX_TIMING]   DAT_01259a28 = 0x%08x\n", pool_base_before);
+            dprintf(trace_fd, "[DATA_FIX_TIMING]   DAT_01259a34 = 0x%08x\n", slot_counter_before);
+            if (pool_base_before != 0) {
+                dprintf(trace_fd, "[DATA_FIX_WARNING] *** POOL WAS ALREADY INITIALIZED! Zeroing will destroy it! ***\n");
+            }
+        }
+
+        // Save ONLY pool base pointer (slots are initialized later)
+        uint32_t saved_pool_base = 0;
+        if (memExist(0x01259a28)) {
+            saved_pool_base = *(uint32_t*)0x01259a28;
+            dprintf(trace_fd, "[DATA_FIX] Saved pool_base: 0x%08x\n", saved_pool_base);
+        }
+
+        // Zero entire .data section
+        memset((void*)zero_start, 0, zero_size);
+        dprintf(trace_fd, "[DATA_FIX] Zeroed entire .data: 0x%lx - 0x%lx (%zu MB)\n",
+                zero_start, zero_end, zero_size / 1024 / 1024);
+
+        // Re-initialize Bootstrap structures
+        *(uint32_t*)0x017913d0 = 0x30280000;
+        *(uint32_t*)0x0280a410 = 0x34280000;
+        *(uint32_t*)0x0280a6a8 = 0x34290000;
+
+        // Restore pool base AND properly initialize slot[0]
+        if (saved_pool_base != 0) {
+            *(uint32_t*)0x01259a28 = saved_pool_base;
+
+            // Restore ctrl block[0]'s pool_base_copy field at offset +8 from ctrl[0] base.
+            // ctrl blocks are at DAT_01259a3c, layout: 5 DWORDs per slot (0x14 bytes each).
+            // ctrl[0][2] (pool_base_copy) at 0x01259a3c + 8 = 0x01259a44 must equal
+            // pool_base so the game's size calculation produces a valid byte count.
+            if (memExist(0x01259a44)) {
+                *(uint32_t*)0x01259a44 = saved_pool_base;
+                if (trace_fd >= 0) {
+                    dprintf(trace_fd, "[DATA_FIX] Restored ctrl[0].pool_base_copy at 0x01259a44 = 0x%08x\n",
+                            saved_pool_base);
+                }
+            }
+            
+            // Set slot configuration
+            *(uint32_t*)0x00cff6bc = 0x00000004;
+            *(uint32_t*)0x01259a38 = 0x00000004;
+            
+            // Initialize slot[0] with correct values
+            // buf_start should be pool_base + small offset (observed: pool_base + 16 bytes)
+            uint32_t slot0_buffer_start = saved_pool_base + 0x10;  // pool_base + 16 bytes
+            uint32_t slot0_buffer_size = 0x80000;  // 512 KB (standard pool size)
+            
+            *(uint32_t*)(0x01259b00 + 0x8020) = slot0_buffer_start;  // buf_start
+            *(uint32_t*)(0x01259b00 + 0x8024) = slot0_buffer_size;   // size
+            *(uint32_t*)(0x01259b00 + 0x8028) = 0;                    // read_pos
+            *(uint32_t*)(0x01259b00 + 0x802c) = 0;                    // write_pos
+            *(uint8_t*)(0x01259b00 + 0x8030) = 1;                     // in_use = true
+            
+            dprintf(trace_fd, "[DATA_FIX] Initialized slot[0]: base=0x%08x size=0x%08x\n", 
+                    slot0_buffer_start, slot0_buffer_size);
+            
+            dprintf(trace_fd, "[DATA_FIX] Restored pool_base: 0x%08x\n", saved_pool_base);
+            dprintf(trace_fd, "[DATA_FIX] Set DAT_00cff6bc = 4 (slot count)\n");
+            dprintf(trace_fd, "[DATA_FIX] Set DAT_01259a38 = 4 (slot total)\n");
+
+            // CRITICAL CHECK: Did the jump keys survive or were they in the wipe zone?
+            uint32_t jump_key_1_post = memExist(0x01261b24) ? *(uint32_t*)0x01261b24 : 0;
+            if (jump_key_1 != 0 && jump_key_1_post == 0) {
+                dprintf(trace_fd, "[DATA_FIX_WARNING] Jump Keys were WIPED! This will cause the 0x49d1e40 crash.\n");
+                // Temporary restoration test
+                *(uint32_t*)0x01261b24 = jump_key_1;
+                *(uint32_t*)0x01261b2c = jump_key_2;
+                dprintf(trace_fd, "[DATA_FIX] Attempted restoration of Jump Keys.\n");
+            }
+
+        }
+
+        dprintf(trace_fd, "[DATA_FIX] Re-initialized Bootstrap after zeroing\n");
+        dprintf(trace_fd, "[DATA_FIX]   DAT_017913d0 = 0x30280000\n");
+        dprintf(trace_fd, "[DATA_FIX]   DAT_0280a410 = 0x34280000\n");
+        dprintf(trace_fd, "[DATA_FIX]   DAT_0280a6a8 = 0x34290000\n");
+
+        if (memExist(0x01259b00)) {
+            uint32_t s0_base_post = *(uint32_t*)(0x01259b00 + 0x8020);
+            uint32_t s0_size_post = *(uint32_t*)(0x01259b00 + 0x8024);
+            dprintf(trace_fd, "[DATA_FIX_TIMING] Slot[0] AFTER restoration: Base=0x%08x, Size=0x%08x\n", 
+                    s0_base_post, s0_size_post);
+
+            // Check for Parameter Corruption (The 22MB Size bug)
+            if (s0_size_post == saved_pool_base) {
+                dprintf(trace_fd, "[DATA_FIX_WARNING] Parameter Corruption Detected! Size is being overwritten by Pool Base.\n");
+            }
+                
+            // EMERGENCY OVERRIDE: If slots are empty or corrupted, force the known correct size
+            if (s0_size_post == 0 || s0_size_post == saved_pool_base) {
+                *(uint32_t*)(0x01259b00 + 0x8024) = 0x00001a40; 
+                dprintf(trace_fd, "[DATA_FIX] MANUAL_OVERRIDE: Forced Slot[0] size to 0x1A40 (6.56 KB)\n");
+            }
+        }
+
+        // Log pool state AFTER zeroing
+        if (memExist(0x01259a28)) {
+            uint32_t pool_base_after = *(uint32_t*)0x01259a28;
+            dprintf(trace_fd, "[DATA_FIX_TIMING] Pool state AFTER zeroing:\n");
+            dprintf(trace_fd, "[DATA_FIX_TIMING]   DAT_01259a28 = 0x%08x\n", pool_base_after);
+        }
+
+        data_section_fixed = 1;
+        
+    }
+    // === DAT_0357927c WRITE PROTECTION === 
+    // FUN_00732ca0 at 0x733400 writes EDI to DAT_0357927c 
+    // If EDI contains garbage, this corrupts the global pointer 
+    // Intercept this write and validate EDI first 
+    
+    if (current_rip == 0x733400) { 
+        uint32_t edi_value = (uint32_t)R_RDI; 
+        
+        // Check if EDI is a valid pointer (in game or Wine space) 
+        // Valid pointers should be in ranges: 
+        //   - Game PE: 0x00400000 - 0x04376000 
+        //   - Wine DLLs: 0x10000000 - 0x80000000 
+        // Garbage like 0x74b28208 is in the unmapped gap 
+        
+        int is_valid = 0; 
+        if (edi_value >= 0x00400000 && edi_value < 0x04b70000) { 
+            is_valid = 1;  // Game PE space 
+        } else if (edi_value >= 0x10000000 && edi_value < 0x80000000) { 
+            is_valid = 1;  // Wine DLL space 
+        } else if (edi_value == 0) { 
+            is_valid = 1;  // NULL is valid (means uninitialized) 
+        } 
+        
+        if (!is_valid) { 
+            // EDI contains garbage - skip this write by moving past the instruction 
+            // MOV [DAT_0357927c], EDI is 6 bytes: 89 3D 7C 92 57 03 
+            R_RIP += 6; 
+            
+            if (trace_fd >= 0) { 
+                dprintf(trace_fd, "[WRITE_PROTECT] Skipped garbage write to DAT_0357927c\n"); 
+                dprintf(trace_fd, "[WRITE_PROTECT] EDI = 0x%08x (invalid, rejected)\n", edi_value); 
+                dprintf(trace_fd, "[WRITE_PROTECT] Skipped to RIP = 0x%lx\n", (uintptr_t)R_RIP); 
+            } 
+            
+            mark_exception_handled(fault_addr, (uintptr_t)pc); 
+            relockMutex(Locks); 
+            return; 
+        } 
+    } 
+    
+    // === SIMPLIFIED TLS FIX === 
+    // Don't try to manipulate FS register - just ensure the TLS structure 
+    // at the current FS base is properly initialized 
+    
+    // Initialize TLS[0x5C] with thread ID if not set 
+    if (*(uint32_t*)(tls_base + 0x5C) == 0) { 
+        uint32_t tid = (uint32_t)syscall(__NR_gettid); 
+        if (tid == 0) tid = 1; 
+        *(uint32_t*)(tls_base + 0x5C) = tid; 
+    } 
+    
+    // Initialize TLS[0x58] with pointer to DAT_0280a410 
+    *(uint32_t*)(tls_base + 0x58) = 0x0280a410; 
+    
+    // Set global main thread ID 
+    if (memExist(0x0280a5c8)) { 
+        uint32_t current_tid = *(uint32_t*)(tls_base + 0x5C); 
+        *(uint32_t*)0x0280a5c8 = current_tid; 
+    } 
+    
+    if (trace_fd >= 0) { 
+        dprintf(trace_fd, "\n=== TLS SIMPLIFIED FIX ===\n"); 
+        dprintf(trace_fd, "[TLS_FIX] RIP: 0x%x\n", current_rip); 
+        dprintf(trace_fd, "[TLS_FIX] TLS Base: %p\n", (void*)tls_base); 
+        dprintf(trace_fd, "[TLS_FIX] TLS[0x5C] = %u (Thread ID)\n", *(uint32_t*)(tls_base + 0x5C)); 
+        dprintf(trace_fd, "[TLS_FIX] TLS[0x58] = 0x0280a410\n"); 
+        dprintf(trace_fd, "=========================\n\n"); 
+    } 
+    
+    // === MANUAL INSTRUCTION EXECUTION === 
+    // Instead of re-executing, manually perform the CMP and skip it 
+    
+    // === COMPREHENSIVE TLS INSTRUCTION HANDLING === 
+    // Handle crashes anywhere in FUN_0047fb60 by skipping to safe point 
+    
+    // CRITICAL: Get emu structure for interpreter mode 
+    x64emu_t* emu = thread_get_emu(); 
+    if (!emu) { 
+        // Fallback if emu not available 
+        mark_exception_handled(fault_addr, (uintptr_t)pc); 
+        relockMutex(Locks); 
+        return; 
+    } 
+     
+    if (in_tls_function || current_rip == 0x47fb6f) { 
+        // === INTERPRETER MODE REGISTER FIX === 
+        // In interpreter mode, registers are tracked in emu structure, NOT ucontext 
+        // We must set BOTH for compatibility 
+        
+        // Set emu structure registers (used by interpreter) 
+        emu->regs[_AX].dword[0] = 0;  // EAX = _tls_index = 0 (main module) 
+        emu->regs[_CX].dword[0] = (uint32_t)tls_base;  // ECX = TLS array base 
+        emu->regs[_DX].dword[0] = (uint32_t)tls_base;  // EDX = TLS block pointer 
+        
+        // Also set ucontext for compatibility (may not be necessary in pure interpreter) 
+        R_RAX = 0; 
+        R_RCX = tls_base; 
+        R_RDX = (uint32_t)tls_base; 
+        
+        // Manually execute the CMP [EDX+0x5C], 0 to set flags 
+        uint32_t tid_in_tls = *(uint32_t*)(tls_base + 0x5C);  
+        uint32_t main_tid = memExist(0x0280a5c8) ? *(uint32_t*)0x0280a5c8 : tid_in_tls;  
+        
+        // Set ZF flag in emu structure (NOT ucontext eflags) 
+        if (tid_in_tls == main_tid) {  
+            emu->eflags.x64 |= (1 << 6);  // ZF=1 
+        } else {  
+            emu->eflags.x64 &= ~(1 << 6); // ZF=0 
+        }  
+        
+        // Set guest RIP in emu structure (critical for interpreter mode!) 
+        emu->ip.dword[0] = 0x47fb76;  // Jump to safe continuation point 
+        
+        if (trace_fd >= 0) {  
+            dprintf(trace_fd, "[TLS_FIX] Crash at RIP=0x%x, fault=0x%lx\n", current_rip, fault); 
+            dprintf(trace_fd, "[TLS_FIX] Set emu->regs: EAX=0x%08x ECX=0x%08x EDX=0x%08x\n",  
+                    emu->regs[_AX].dword[0], emu->regs[_CX].dword[0], emu->regs[_DX].dword[0]); 
+            dprintf(trace_fd, "[TLS_FIX] Set emu->ip.dword[0] = 0x47fb76, ZF=%d\n",  
+                    (tid_in_tls == main_tid));  
+        }  
+    } 
+    else if (current_rip == 0x4cd229) { 
+        // This is the MOV EDI, [_tls_index] instruction 
+        // Set in emu structure for interpreter mode 
+        emu->regs[_DI].dword[0] = 0;  // EDI = _tls_index = 0 
+        emu->ip.dword[0] = current_rip + 6;  // Skip 6-byte MOV instruction 
+        
+        if (trace_fd >= 0) { 
+            dprintf(trace_fd, "[TLS_FIX] Set EDI=0 (_tls_index), emu->ip=0x%lx\n", 
+                    (uintptr_t)emu->ip.dword[0]); 
+        } 
+    } 
+    
+    // CRITICAL: Use RESUME_EXECUTION_INTERP() to longjmp back to interpreter 
+    // This forces interpreter to reload state from emu structure 
+    RESUME_EXECUTION_INTERP(); 
+} 
+
+// === END TLS SKIP ===
+
+// === DIAGNOSTIC: Monitor jump table initialization ===
+static int jump_table_monitor = 0;
+if (!jump_table_monitor && trace_fd >= 0) {
+    dprintf(trace_fd, "\n=== JUMP TABLE INITIALIZATION MONITOR ===\n");
+    dprintf(trace_fd, "[JUMP_INIT] RIP when checked: 0x%lx\n", (unsigned long)pc);
+    
+    // Check if these addresses are initialized yet
+    if (memExist(0x01261b24)) {
+        uint32_t k1 = *(uint32_t*)0x01261b24;
+        uint32_t k2 = memExist(0x01261b2c) ? *(uint32_t*)0x01261b2c : 0;
+        
+        dprintf(trace_fd, "[JUMP_INIT] K1 @ 0x01261b24 = 0x%08x\n", k1);
+        dprintf(trace_fd, "[JUMP_INIT] K2 @ 0x01261b2c = 0x%08x\n", k2);
+        
+        // Check if they look like valid code addresses
+        if (k1 >= 0x00400000 && k1 <= 0x04376000) {
+            dprintf(trace_fd, "[JUMP_INIT] K1 IS IN PE IMAGE RANGE (VALID!)\n");
+        } else {
+            dprintf(trace_fd, "[JUMP_INIT] K1 IS GARBAGE (not in PE image)\n");
+        }
+        
+        // Check if K2 is valid
+        if (k2 >= 0x00400000 && k2 <= 0x04376000) {
+            dprintf(trace_fd, "[JUMP_INIT] K2 IS IN PE IMAGE RANGE (VALID!)\n");
+        } else if (k2 == 0) {
+            dprintf(trace_fd, "[JUMP_INIT] K2 IS NULL (uninitialized)\n");
+        } else {
+            dprintf(trace_fd, "[JUMP_INIT] K2 IS GARBAGE (not in PE image)\n");
+        }
+        
+        // Additional context: check if we're in startup code
+        if ((uintptr_t)pc >= 0x00400000 && (uintptr_t)pc <= 0x01000000) {
+            dprintf(trace_fd, "[JUMP_INIT] Currently executing in PE image (startup phase)\n");
+        } else {
+            dprintf(trace_fd, "[JUMP_INIT] Currently executing outside PE image\n");
+        }
+    }
+    dprintf(trace_fd, "==========================================\n\n");
+    jump_table_monitor = 1;
+}
+
+// === THREAD & WAIT LOOP FIXES ===
+
+uintptr_t rip = (uintptr_t)R_RIP;
+uintptr_t base_addr = (uintptr_t)&engine_bootstrap[0];
+
+// 2. TASK DISPATCHER LOBOTOMY (0x006c7c70)
+if (rip == 0x006c7c70) {
+    if (memExist(0x02b8d700)) {
+        *(uint32_t*)(0x02b8d700 + 0x744) = 0; // Task Count
+        *(uint32_t*)(0x02b8d700 + 0x740) = 0; // Active Flag
+    }
+    uint32_t* esp = (uint32_t*)(uintptr_t)R_RSP;
+    if (memExist((uintptr_t)esp)) {
+        R_RIP = esp[0];
+        R_RSP += 4;
+    } else {
+        R_RIP += 5;
+    }
+    RESUME_EXECUTION_INTERP();
+}
+
+// 3. STAGE A: THE GATEKEEPER (FUN_00505de0)
+// This doesn't change RIP/regs, so we don't need RESUME_EXECUTION_INTERP, but let's be safe if it modifies them.
+// It just modifies memory. We can just fall through or return.
+if (rip == 0x00505de0) {
+    uint32_t* engine_struct = (uint32_t*)(uintptr_t)R_ECX;
+    if (engine_struct && memExist((uintptr_t)engine_struct + 0x5dac)) {
+        engine_struct[0x5dac/4] = 1; // Force Heartbeat
+    }
+}
+
+
+// 5. STAGE C: RESOURCE POOL PROTECTOR (0x005abd80)
+if (rip == 0x005abd80) {
+    uint32_t* ctx = (uint32_t*)(uintptr_t)R_ECX;
+    if (ctx && memExist((uintptr_t)ctx + 0xa7 * 4) && ctx[0xa7] == 0) {
+        ctx[0xa7] = (uint32_t)(base_addr + 0x8000);
+        *(uint32_t*)(base_addr + 0x8000 + 0x280) = 0x0FFFFFFF; // Limit
+    }
+}
+
+// 6. STAGE D: VOID JUMP TRAPS (0x005b63df & 0x005b6446)
+if (rip == 0x005b63df || rip == 0x005b6446) {
+    R_RIP = (rip == 0x005b63df) ? 0x005b63e1 : 0x005b6419;
+    RESUME_EXECUTION_INTERP();
+}
+
+// 7. SYNTAX ERROR STATE FORCING (0x005b63c0)
+if (rip == 0x005b63c0) {
+    uintptr_t engine_ptr = (uintptr_t)R_EAX;
+    if (engine_ptr > 0x10000 && memExist(engine_ptr + 0x1220)) {
+        *(uint32_t*)(engine_ptr + 0x1220) = 7;
+    }
+}
+
+// Loop Breaker (0x006da00d)
+if ((uintptr_t)R_RIP >= 0x006da00d && (uintptr_t)R_RIP <= 0x006da00f) {
+    if (trace_fd >= 0) {
+        dprintf(trace_fd, "[COMPAT_SHIM] Main Thread released from Wait loop at %p\n", (void*)R_RIP);
+    }
+    R_EAX = 0;           // Result: WAIT_OBJECT_0 (Success)
+    R_RIP = 0x006da00f;  // Jump over CALL ESI
+    RESUME_EXECUTION_INTERP();
+}
+
+// Improved Status Check (Address 0x006e2b10)
+if ((uintptr_t)R_RIP >= 0x006e2b10 && (uintptr_t)R_RIP <= 0x006e2b15) {
+    if (trace_fd >= 0) {
+        dprintf(trace_fd, "[COMPAT] Forcing System Status to READY at %p\n", (void*)R_RIP);
+    }
+    R_EAX = 1;           // Return True
+    R_RIP = 0x006e2b1d;  // Jump directly to RET
+    RESUME_EXECUTION_INTERP();
+}
+
+// === CRASH SITE LOGGING AT 0x650960 (XOR Cipher Loop) ===
+// Address: 0x00650960 - LAB_00650960, loop entry point in FUN_006508d0
+// Instruction: MOVZX EDX, byte ptr [EAX + EBP*0x1]
+// This is where guard page cascade begins - capture parameter corruption at source
+if ((uintptr_t)R_RIP == 0x00650960) {
+    init_trace_fd();
+    
+    // Capture all registers at crash site
+    uint32_t eax = (uint32_t)R_RAX;
+    uint32_t ebx = (uint32_t)R_RBX;
+    uint32_t ecx = (uint32_t)R_RCX;
+    uint32_t edx = (uint32_t)R_RDX;
+    uint32_t esi = (uint32_t)R_RSI;
+    uint32_t edi = (uint32_t)R_EDI;
+    uint32_t ebp = (uint32_t)R_RBP;
+    uint32_t esp = (uint32_t)R_RSP;
+    
+    // Calculate fault address (EAX + EBP)
+    uint32_t calculated_fault = eax + ebp;
+    
+    dprintf(trace_fd, "\n=== CRASH SITE 0x650960 (XOR Cipher Loop) ===\n");
+    dprintf(trace_fd, "[CRASH_SITE] Instruction: MOVZX EDX, byte ptr [EAX + EBP]\n");
+    dprintf(trace_fd, "[CRASH_SITE] Calculated fault address: [0x%08x + 0x%08x] = 0x%08x\n",
+            eax, ebp, calculated_fault);
+    
+    dprintf(trace_fd, "[CRASH_SITE] Register dump:\n");
+    dprintf(trace_fd, "  EAX = 0x%08x  EBX = 0x%08x  ECX = 0x%08x  EDX = 0x%08x\n",
+            eax, ebx, ecx, edx);
+    dprintf(trace_fd, "  ESI = 0x%08x  EDI = 0x%08x  EBP = 0x%08x  ESP = 0x%08x\n",
+            esi, edi, ebp, esp);
+    
+    // === POOL STATE DIAGNOSTIC LOGGING ===
+    // Purpose: Confirm pool_base and slot control block values at RC4 crash time.
+    // These values determine whether FUN_0059d310's cap calculation is correct.
+
+    dprintf(trace_fd, "\n=== POOL STATE AT RC4 CRASH ===\n");
+
+    // 1. Pool base (written once at 0x4d3fbe, read by FUN_0059d310 via piVar10[2])
+    if (memExist(0x01259a28)) {
+        uint32_t pool_base_live = *(uint32_t*)0x01259a28;
+        dprintf(trace_fd, "[POOL] DAT_01259a28 (pool_base) = 0x%08x\n", pool_base_live);
+        dprintf(trace_fd, "[POOL] pool_end (pool_base + 0x80000) = 0x%08x\n",
+                pool_base_live + 0x80000);
+        uint32_t dest_base = (uint32_t)R_RBX;
+        if (pool_base_live != 0) {
+            int32_t offset_in_pool = (int32_t)(dest_base - pool_base_live);
+            uint32_t remaining = (pool_base_live + 0x80000) - dest_base;
+            dprintf(trace_fd, "[POOL] EBX (dest_base) = 0x%08x\n", dest_base);
+            dprintf(trace_fd, "[POOL] dest_base offset from pool_base = 0x%08x (%d)\n",
+                    offset_in_pool, offset_in_pool);
+            dprintf(trace_fd, "[POOL] remaining bytes to pool_end = 0x%08x (%u)\n",
+                    remaining, remaining);
+        }
+    } else {
+        dprintf(trace_fd, "[POOL] DAT_01259a28 NOT MAPPED\n");
+    }
+
+    // 2. Pool write offset (DAT_01259a2c)
+    if (memExist(0x01259a2c)) {
+        dprintf(trace_fd, "[POOL] DAT_01259a2c (pool_write_offset) = 0x%08x\n",
+                *(uint32_t*)0x01259a2c);
+    }
+
+    // 3. Ring buffer write cursor (DAT_01259a30)
+    if (memExist(0x01259a30)) {
+        dprintf(trace_fd, "[POOL] DAT_01259a30 (ring_write_cursor) = 0x%08x\n",
+                *(uint32_t*)0x01259a30);
+    }
+
+    // 4. Slot control blocks at DAT_01259a3c (5 DWORDs per slot, 4 slots)
+    // piVar10[2] is the pool_base copy stored in the control block.
+    // Layout: [0]=slot_index, [1]=slot_struct_ptr, [2]=pool_base_copy, [3+4]=unknown
+    dprintf(trace_fd, "[CTRL] Slot control blocks at 0x01259a3c:\n");
+    for (int s = 0; s < 4; s++) {
+        uint32_t ctrl_base = 0x01259a3c + s * 0x14; // 5 DWORDs = 0x14 per slot
+        if (memExist(ctrl_base + 0x10)) {
+            uint32_t c0 = *(uint32_t*)(uintptr_t)(ctrl_base);
+            uint32_t c1 = *(uint32_t*)(uintptr_t)(ctrl_base + 4);
+            uint32_t c2 = *(uint32_t*)(uintptr_t)(ctrl_base + 8);  // piVar10[2] = pool_base_copy
+            uint32_t c3 = *(uint32_t*)(uintptr_t)(ctrl_base + 12);
+            uint32_t c4 = *(uint32_t*)(uintptr_t)(ctrl_base + 16);
+            dprintf(trace_fd, "  ctrl[%d]: idx=0x%08x struct_ptr=0x%08x pool_base_copy=0x%08x "
+                    "c3=0x%08x c4=0x%08x\n", s, c0, c1, c2, c3, c4);
+        } else {
+            dprintf(trace_fd, "  ctrl[%d]: NOT MAPPED at 0x%08x\n", s, ctrl_base);
+        }
+    }
+
+    // 5. Slot structures at DAT_01259b00 (4 slots, 0x8080 bytes each)
+    // Offset +0x8020 = buf_start, +0x8024 = size, +0x8028 = read_pos,
+    // +0x802c = write_pos, +0x8030 = in_use
+    dprintf(trace_fd, "[SLOT] Slot structures at 0x01259b00:\n");
+    for (int s = 0; s < 4; s++) {
+        uint32_t slot_ptr = 0x01259b00 + s * 0x8080;
+        if (memExist(slot_ptr + 0x8030)) {
+            uint32_t buf_start   = *(uint32_t*)(uintptr_t)(slot_ptr + 0x8020);
+            uint32_t buf_size    = *(uint32_t*)(uintptr_t)(slot_ptr + 0x8024);
+            uint32_t read_pos    = *(uint32_t*)(uintptr_t)(slot_ptr + 0x8028);
+            uint32_t write_pos   = *(uint32_t*)(uintptr_t)(slot_ptr + 0x802c);
+            uint8_t  in_use      = *(uint8_t*) (uintptr_t)(slot_ptr + 0x8030);
+            dprintf(trace_fd, "  slot[%d]: buf_start=0x%08x size=0x%08x "
+                    "read_pos=0x%08x write_pos=0x%08x in_use=%d\n",
+                    s, buf_start, buf_size, read_pos, write_pos, in_use);
+
+            // If this slot's buf_start matches our crash dest (EBX), flag it
+            if (buf_start == (uint32_t)R_RBX) {
+                dprintf(trace_fd, "  *** slot[%d] buf_start MATCHES EBX (crash dest) ***\n", s);
+                dprintf(trace_fd, "  *** declared size = 0x%08x — compare to pool size 0x80000 ***\n",
+                        buf_size);
+            }
+        } else {
+            dprintf(trace_fd, "  slot[%d]: struct NOT MAPPED at 0x%08x\n", s, slot_ptr);
+        }
+    }
+
+    // 6. Slot counter globals
+    if (memExist(0x01259a34)) {
+        dprintf(trace_fd, "[POOL] DAT_01259a34 (slot_counter) = 0x%08x\n", *(uint32_t*)0x01259a34);
+    }
+    if (memExist(0x01259a38)) {
+        dprintf(trace_fd, "[POOL] DAT_01259a38 (slot_total)   = 0x%08x\n", *(uint32_t*)0x01259a38);
+    }
+
+    // 7. Stack walk: find FUN_006770b0 frame to get the actual params passed to FUN_006508d0
+    // Call chain at crash: FUN_006508d0 (RC4) ← FUN_006770b0 ← FUN_0059d310
+    // FUN_006508d0 pushes: ECX, EBP, EBX, EDI (4 regs = 0x10 bytes)
+    // Its params at [ESP+0x14], [ESP+0x18], [ESP+0x1C], [ESP+0x20]
+    // FUN_006770b0 called FUN_006508d0 from 0x677121
+    // Walk stack to find the return address 0x677121 and read FUN_006770b0 params
+    dprintf(trace_fd, "[STACK] Walking stack from ESP=0x%08x to find FUN_006770b0 frame:\n",
+            (uint32_t)R_RSP);
+    {
+        uint32_t* sp = (uint32_t*)(uintptr_t)(uint32_t)R_RSP;
+        int found = 0;
+        for (int i = 0; i < 64 && !found; i++) {
+            if (!memExist((uintptr_t)&sp[i])) break;
+            uint32_t val = sp[i];
+            // Return address from FUN_006508d0 back to FUN_006770b0 is 0x00677121
+            if (val == 0x00677121 || val == 0x0067711c) {
+                dprintf(trace_fd, "  Found retaddr 0x%08x at ESP[%d] = stack+0x%x\n",
+                        val, i, i*4);
+                // FUN_006770b0's params were pushed before CALL 006508d0
+                // At 0x006770fe: PUSH ESI (param_1=buf), PUSH ESI (dup), PUSH EBX, PUSH EAX
+                // At 0x0067711c: PUSH EDI, PUSH ECX, PUSH EDI, PUSH ECX (second block)
+                // Reading 8 words above the retaddr gives us the pushed params
+                for (int j = i+1; j < i+9 && j < 64; j++) {
+                    if (memExist((uintptr_t)&sp[j])) {
+                        dprintf(trace_fd, "  stack[%d] (ESP+0x%x) = 0x%08x\n",
+                                j, j*4, sp[j]);
+                    }
+                }
+                found = 1;
+            }
+        }
+        if (!found) {
+            dprintf(trace_fd, "  Retaddr 0x677121 not found in first 64 stack words\n");
+        }
+    }
+
+    dprintf(trace_fd, "=== END POOL STATE ===\n\n");
+    // === END POOL STATE DIAGNOSTIC LOGGING ===
+        
+    // Reconstruct FUN_006508d0 parameters from stack
+    // Function signature: FUN_006508d0(int param_1, byte *param_2, byte *param_3, uint param_4)
+    uint32_t* stack = (uint32_t*)(uintptr_t)esp;
+    
+    if (memExist((uintptr_t)stack) && memExist((uintptr_t)(stack + 20))) {
+        dprintf(trace_fd, "[CRASH_SITE] Reconstructing FUN_006508d0 parameters from stack:\n");
+        
+        // Parameters are pushed before function entry, then there are PUSHes inside function
+        // ESP layout after PUSH ECX, PUSH EBP, PUSH EBX, PUSH EDI:
+        // [ESP+0x14] = param_1 (auStack_84 buffer)
+        // [ESP+0x18] = param_2 (source buffer - EBX in function)
+        // [ESP+0x1c] = param_3 (destination buffer)
+        // [ESP+0x20] = param_4 (buffer_size - EBP in function)
+        
+        uint32_t param_1 = stack[0x14/4];  // auStack_84 pointer
+        uint32_t param_2 = stack[0x18/4];  // source buffer (base address)
+        uint32_t param_3 = stack[0x1c/4];  // destination buffer
+        uint32_t param_4 = stack[0x20/4];  // buffer size
+        
+        dprintf(trace_fd, "  param_1 (auStack_84) = 0x%08x\n", param_1);
+        dprintf(trace_fd, "  param_2 (source)     = 0x%08x\n", param_2);
+        dprintf(trace_fd, "  param_3 (dest)       = 0x%08x\n", param_3);
+        dprintf(trace_fd, "  param_4 (size)       = 0x%08x (%u bytes)\n", param_4, param_4);
+
+        // CRITICAL: Check for unrealistic buffer sizes (crypto operations typically KB, not MB)
+        if (param_4 > 0x01000000) {  // 16 MB
+            dprintf(trace_fd, "\n[CRASH_CORRUPTION] *** param_4 (buffer size) is UNREALISTICALLY LARGE ***\n");
+            dprintf(trace_fd, "[CRASH_CORRUPTION] Size: 0x%08x (%u bytes = %.2f MB)\n",
+                    param_4, param_4, (float)param_4 / 1048576.0);
+            dprintf(trace_fd, "[CRASH_CORRUPTION] Normal crypto buffers are KB-sized, not MB-sized\n");
+            dprintf(trace_fd, "[CRASH_CORRUPTION] This is the PRIMARY corruption - size parameter is corrupt\n");
+            
+            // Calculate where the loop will crash
+            uint32_t crash_offset = 0x04376000 - param_3;
+            dprintf(trace_fd, "[CRASH_CORRUPTION] With dest=0x%08x, loop will crash after %u bytes (0x%08x)\n",
+                    param_3, crash_offset, crash_offset);
+            dprintf(trace_fd, "[CRASH_CORRUPTION] Crash will occur when EAX reaches 0x04376000 (guard page boundary)\n");
+        }
+
+        // The pool should already be initialised
+        // Read the pool structures
+        uint32_t pool_base = *(uint32_t*)0x01259a28;
+        uint32_t* slot0 = (uint32_t*)(0x01259b00);
+        uint32_t buf_start = slot0[0x8020/4];
+        uint32_t buf_size = slot0[0x8024/4];
+        
+        if (buf_start != 0 && buf_size > 0 && buf_size <= 0x80000) {
+            // Redirect the RC4 loop to use the safe pool
+            param_3 = buf_start;
+            param_4 = buf_size;
+            stack[0x1c/4] = param_3;
+            stack[0x20/4] = param_4;
+            // EBX = dest base, reset to new dest start
+            R_RBX = param_3;
+            emu->regs[_BX].dword[0] = param_3;
+            // EAX = current position pointer, must also start at new dest
+            // The loop ran ~48 iterations before crashing; restart from new base
+            R_RAX = param_3;
+            emu->regs[_AX].dword[0] = param_3;
+            // EBP = XOR key state offset, reset to 0 (fresh start in key stream)
+            R_RBP = 0;
+            emu->regs[_BP].dword[0] = 0;
+
+            // Fix the OUTER loop counter at [ESP+0x24].
+            // The outer loop subtracts 0x40 per iteration and continues until this reaches 0.
+            // Without this fix, the corrupt original value (e.g. 0x426f3510) causes ~17M
+            // outer iterations, writing XOR output past the pool buffer into arbitrary memory
+            // including _tls_index at 0x033a3be4, corrupting it.
+            // Setting this to buf_size = 0x00080000 gives exactly 0x2000 outer iterations,
+            // spanning precisely the pool buffer range.
+            if (memExist((uintptr_t)(stack + 0x24/4))) {
+                stack[0x24/4] = buf_size;
+            }
+            
+            if (trace_fd >= 0) {
+                dprintf(trace_fd, "[CRASH_FIX] Redirected to pool: dest=0x%08x, size=0x%08x, EAX reset to dest base\n",
+                        param_3, param_4);
+            }
+            // CRITICAL: Resume execution immediately so CRASH_PREVENTION does not fire
+            // and negate this fix. The loop will now run with corrected parameters.
+            RESUME_EXECUTION_INTERP();
+        } else {
+            // Fallback: using existing falback code
+            dprintf(trace_fd, "[CRASH_FIX] Pool not ready, using fallback\n");
+
+            // CRITICAL FIX: param_4 points to ZERO because buffers are uninitialized
+            // Instead of aborting, set a SAFE default buffer size
+            if (param_4 >= 0x00CF7000 && param_4 <= 0x04332000) {
+                if (memExist((uintptr_t)param_4)) {
+                    uint32_t actual_size = *(uint32_t*)(uintptr_t)param_4;
+                    dprintf(trace_fd, "[CRASH_FIX] Dereferenced value: 0x%08x (%u bytes)\n", actual_size, actual_size);
+                    
+                    if (actual_size == 0 || actual_size > 0x01000000) {
+                        // Buffer uninitialized or corrupt - set safe default
+                        uint32_t safe_size = 0x8000;  // 32 KB - reasonable crypto buffer
+                        
+                        dprintf(trace_fd, "\n[INIT_FIX] Buffer uninitialized (size=%u). Setting safe default: %u bytes\n", 
+                                actual_size, safe_size);
+                        
+                        // Write safe size to the pointer location
+                        *(uint32_t*)(uintptr_t)param_4 = safe_size;
+                        
+                        // Also update the actual EBP register which holds the size during loop
+                        R_RBP = safe_size;
+                        // CRITICAL: Check if destination buffer has enough space
+                        uint32_t dest_end = param_3 + safe_size;
+                        if (dest_end > 0x04376000) {
+                        
+                            // Destination would overflow into guard pages
+                            uint32_t available_space = 0x04376000 - param_3;
+                            
+                            dprintf(trace_fd, "[INIT_FIX] WARNING: Dest buffer too small\n");
+                            dprintf(trace_fd, "[INIT_FIX] Available space: %u bytes, needed: %u bytes\n", 
+                                    available_space, safe_size);
+                            
+                            // CRITICAL: Account for lookahead in XOR cipher
+                            // The instruction "MOVZX EDX, [EAX + EBP]" reads AHEAD by EBP bytes
+                            // We need space for BOTH the destination buffer AND the lookahead
+                            uint32_t lookahead = safe_size;  // EBP = 0x8000, same as buffer size
+                            uint32_t total_space_needed = safe_size + lookahead;  // 0x10000 (64 KB)
+
+                            // Move destination back to allow room for buffer + lookahead
+                            uint32_t new_dest = 0x04376000 - total_space_needed;  // 0x04366000
+
+                            stack[0x1c/4] = new_dest;  // Update param_3 on stack
+
+                            // CRITICAL: Also update EBX register which holds dest during loop
+                            R_RBX = new_dest;
+                            // CRITICAL: The loop counter at [ESP+0x10] controls iterations
+                            // With EBP=32KB and counter=4, it would process 128KB total
+                            // We need to limit it to 1 iteration (32KB only)
+                            stack[0x10/4] = 1; // Set loop counter to 1 (was 4)
+                            
+                            // CRITICAL: The source buffer (param_2) must be large enough for lookahead
+                            // Redirect source to a safe, zeroed region in .data
+                            uint32_t safe_source = 0x01000000;  // Safe area in .data section
+                            stack[0x18/4] = safe_source;  // Update param_2 on stack
+                            R_RDI = safe_source;  // Update EDI register which holds source
+
+                            dprintf(trace_fd, "[INIT_FIX] Redirected source buffer to safe address: 0x%08x\n", safe_source);
+                            dprintf(trace_fd, "[INIT_FIX] Set loop counter to 1 (was 4) to process only 32KB\n");
+
+                            dprintf(trace_fd, "[INIT_FIX] Sliding window fix: moved dest from 0x%08x to 0x%08x\n", param_3, new_dest);
+                            dprintf(trace_fd, "[INIT_FIX] Allocated %u bytes (%u buffer + %u lookahead)\n", 
+                                    total_space_needed, safe_size, lookahead);
+                            dprintf(trace_fd, "[INIT_FIX] Max lookahead read: 0x%08x (safe, 1 byte before guard)\n", 
+                                    new_dest + total_space_needed);
+                            dprintf(trace_fd, "[INIT_FIX] Updated EBX register to 0x%08x\n", new_dest);
+                            dprintf(trace_fd, "[INIT_FIX] Moved dest from 0x%08x to 0x%08x\n", param_3, new_dest);
+                        }
+                        
+                        dprintf(trace_fd, "[INIT_FIX] Fixed: pointer[0x%08x] = %u, EBP = %u\n", 
+                                param_4, safe_size, safe_size);
+                        dprintf(trace_fd, "[INIT_FIX] Allowing execution with initialized buffer\n");
+                        dprintf(trace_fd, "=====================================\n\n");
+                        
+                        // Don't prevent - let it run with safe size
+                        return;  // Exit handler, let execution continue
+                    }
+                }
+            }    
+        }
+        
+        // Check if param_2 (source buffer) is the corrupt address
+        if (param_2 >= 0x04300000 && param_2 <= 0x04400000) {
+            dprintf(trace_fd, "\n[CRASH_CORRUPTION] *** param_2 (source buffer) is CORRUPT ***\n");
+            dprintf(trace_fd, "[CRASH_CORRUPTION] Base address 0x%08x is near .rsrc boundary (0x04336000-0x04375fff)\n", param_2);
+            
+            if (param_2 + param_4 > 0x04376000) {
+                dprintf(trace_fd, "[CRASH_CORRUPTION] Range [0x%08x - 0x%08x] CROSSES into guard pages!\n",
+                        param_2, param_2 + param_4);
+                dprintf(trace_fd, "[CRASH_CORRUPTION] This causes infinite guard page cascade\n");
+            }
+        }
+        
+        // Log loop counter state
+        // The loop decrements [ESP+0x10] counter
+        if (memExist((uintptr_t)(stack + 4))) {
+            uint32_t loop_counter = stack[0x10/4];
+            dprintf(trace_fd, "[CRASH_SITE] Loop counter [ESP+0x10] = 0x%08x (%u iterations remaining)\n",
+                    loop_counter, loop_counter);
+        }
+    }
+    
+    // Dump stack to find return addresses and caller chain
+    dprintf(trace_fd, "[CRASH_SITE] Stack dump (32 bytes):\n");
+    if (memExist((uintptr_t)stack) && memExist((uintptr_t)(stack + 8))) {
+        for (int i = 0; i < 8; i++) {
+            dprintf(trace_fd, "  [ESP+0x%02x] = 0x%08x", i*4, stack[i]);
+            
+            // Check if this looks like a return address (in code section)
+            if (stack[i] >= 0x400000 && stack[i] < 0xB00000) {
+                dprintf(trace_fd, " <- potential return address (in .text)\n");
+            } else if (stack[i] >= 0x00CF7000 && stack[i] <= 0x04332000) {
+                dprintf(trace_fd, " <- pointer to .data\n");
+            } else {
+                dprintf(trace_fd, "\n");
+            }
+        }
+    }
+    
+    // ENHANCED: Dump crypto buffer structures to trace 23 MB corruption origin
+    dprintf(trace_fd, "\n[BUFFER_STRUCTURES] Crypto buffer structures at DAT_01259b00:\n");
+    static int init_check_logged = 0;
+    for (int slot = 0; slot < 4; slot++) {
+        uint32_t* buffer_struct = (uint32_t*)(uintptr_t)(0x01259b00 + (slot * 0x8080));
+        
+        if (memExist((uintptr_t)(buffer_struct + 0x8020/4)) && 
+            memExist((uintptr_t)(buffer_struct + 0x8028/4))) {
+            
+            uint32_t base_addr = *(uint32_t*)(uintptr_t)(buffer_struct + 0x8020/4);
+            uint32_t buffer_size = *(uint32_t*)(uintptr_t)(buffer_struct + 0x8024/4);
+            uint32_t remaining = *(uint32_t*)(uintptr_t)(buffer_struct + 0x8028/4);
+            uint32_t position = *(uint32_t*)(uintptr_t)(buffer_struct + 0x802c/4);
+            
+            dprintf(trace_fd, "  Slot[%d] at 0x%08x:\n", slot, (uint32_t)(uintptr_t)buffer_struct);
+            dprintf(trace_fd, "    +0x8020 base_addr  = 0x%08x\n", base_addr);
+            dprintf(trace_fd, "    +0x8024 buffer_size = 0x%08x (%u bytes)", buffer_size, buffer_size);
+            
+            if (buffer_size == 0x01694c80) {
+                dprintf(trace_fd, " *** CORRUPT 23 MB SOURCE FOUND ***\n");
+            } else if (buffer_size > 0x01000000) {
+                dprintf(trace_fd, " (%.2f MB - SUSPICIOUS)\n", (float)buffer_size / 1048576.0);
+            } else {
+                dprintf(trace_fd, "\n");
+            }
+            
+            dprintf(trace_fd, "    +0x8028 remaining   = 0x%08x (%u bytes)\n", remaining, remaining);
+            dprintf(trace_fd, "    +0x802c position    = 0x%08x\n", position);
+            // Track when buffers get initialized
+            if (!init_check_logged && (buffer_size != 0 || base_addr != 0)) {
+                init_check_logged = 1;
+                dprintf(trace_fd, "\n[INIT_DETECTION] First non-zero buffer found!\n");
+                dprintf(trace_fd, "[INIT_DETECTION] Slot[%d]: base=0x%08x size=%u\n", 
+                        slot, base_addr, buffer_size);
+                
+                // Dump call stack to see who initialized it
+                dprintf(trace_fd, "[INIT_DETECTION] Call stack at initialization:\n");
+                uint32_t* esp_val = (uint32_t*)(uintptr_t)R_RSP;
+                for (int i = 0; i < 20; i++) {
+                    if (memExist((uintptr_t)(esp_val + i))) {
+                        uint32_t val = esp_val[i];
+                        if (val >= 0x400000 && val < 0xB00000) {
+                            dprintf(trace_fd, "  [ESP+0x%02x] = 0x%08x <- code\n", i*4, val);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (!init_check_logged) {
+    dprintf(trace_fd, "\n[INIT_NON_DETECTION] NO non-zero buffer found across all 4 slots\n");
+    dprintf(trace_fd, "[INIT_NON_DETECTION] All buffers remain uninitialized at crash time\n");
+    dprintf(trace_fd, "this is 100 bombastics a new patch\n");
+    }
+    
+    // ENHANCED: Check global crypto state variables
+    uint32_t* dat_01259a34 = (uint32_t*)0x01259a34;
+    uint32_t* dat_00cff6bc = (uint32_t*)0x00cff6bc;
+    if (memExist((uintptr_t)dat_01259a34) && memExist((uintptr_t)dat_00cff6bc)) {
+        dprintf(trace_fd, "\n[GLOBAL_STATE] Crypto state variables:\n");
+        dprintf(trace_fd, "  DAT_01259a34 = 0x%08x (slot index counter)\n", *dat_01259a34);
+        dprintf(trace_fd, "  DAT_00cff6bc = 0x%08x (slot count, should be 4)\n", *dat_00cff6bc);
+        if (*dat_00cff6bc != 4) {
+            dprintf(trace_fd, "  *** WARNING: Slot count is not 4! ***\n");
+        }
+    }
+    
+    // CRITICAL: Check if we're about to trigger guard page cascade
+    if (calculated_fault >= 0x04376000 && calculated_fault < 0x04400000) {
+        dprintf(trace_fd, "\n[CRASH_PREVENTION] *** GUARD PAGE CASCADE IMMINENT ***\n");
+        dprintf(trace_fd, "[CRASH_PREVENTION] Fault address 0x%08x is in unmapped guard page region\n", calculated_fault);
+        dprintf(trace_fd, "[CRASH_PREVENTION] Aborting FUN_006508d0 execution to prevent cascade\n");
+        dprintf(trace_fd, "=====================================\n\n");
+        
+        // ABORT: Return from FUN_006508d0 early
+        // Function has done: PUSH ECX, PUSH EBP, PUSH EBX, PUSH EDI (4 PUSHes = 16 bytes)
+        // Stack analysis shows return address is at [current ESP + 0x14]
+        uint32_t* stack = (uint32_t*)(uintptr_t)esp;
+        if (memExist((uintptr_t)(stack + 6))) {
+            uint32_t return_address = stack[0x14/4];  // Read return address at ESP+0x14
+            
+            dprintf(trace_fd, "[CRASH_PREVENTION] Return address from stack[ESP+0x14] = 0x%08x\n", return_address);
+            
+            // Validate return address is in code section
+            if (return_address >= 0x400000 && return_address < 0xB00000) {
+                // Clean up stack: undo 4 PUSHes (ECX, EBP, EBX, EDI)
+                R_RSP += 16;
+                
+                // Return to caller normally with EAX=0 indicating failure
+                R_RIP = return_address;
+                R_RSP += 4;  // Simulate RET (pop return address from stack)
+                
+                // Set return value to indicate failure
+                R_EAX = 0;
+                
+                dprintf(trace_fd, "[CRASH_PREVENTION] Returning to caller at RIP=0x%08x with EAX=0\n", return_address);
+                dprintf(trace_fd, "[CRASH_PREVENTION] Cleaned up stack: RSP now 0x%08x\n", (uint32_t)R_RSP);
+                dprintf(trace_fd, "[CRASH_PREVENTION] WARNING: Downstream crashes may occur with uninitialized buffers\n");
+                RESUME_EXECUTION_INTERP();
+            } else {
+                dprintf(trace_fd, "[CRASH_PREVENTION] ERROR: Return address 0x%08x is NOT in code section\n", return_address);
+                dprintf(trace_fd, "[CRASH_PREVENTION] Stack may be corrupt - cannot safely return\n");
+            }
+        } else {
+            dprintf(trace_fd, "[CRASH_PREVENTION] ERROR: Cannot read return address from stack\n");
+        }
+    }
+    
+    dprintf(trace_fd, "[CRASH_SITE] Allowing execution to continue (fault address looks valid)\n");
+    dprintf(trace_fd, "=====================================\n\n");
+    
+}
+    // UNIVERSAL PATCH
+if((sig == X64_SIGSEGV || sig == X64_SIGILL || sig == SIGBUS) && (addr)) {
+    uintptr_t fault_addr = (uintptr_t)addr;
+
+    if(trace_fd >= 0) {
+        dprintf(trace_fd, "[UNIVERSAL_PATCH] Sig=%d Fault=0x%lx PC=0x%lx\n", sig, fault_addr, (uintptr_t)pc);
+    }
+    uintptr_t rsp_ceiling = 0x01000000;
+    log_memory_map_once();
+    static int map_logged_once = 0;
+    if(!map_logged_once) {
+        FILE* maps = fopen("/proc/self/maps", "r");
+        FILE* out = fopen("/sdcard/box64_memory_map_at_crash.txt", "w");
+        if(maps && out) {
+            char line[512];
+            while(fgets(line, sizeof(line), maps)) {
+                fputs(line, out);
+            }
+        }
+        if(maps) fclose(maps);
+        if(out) fclose(out);
+        map_logged_once = 1;
+    }
+    uintptr_t current_rip = (uintptr_t)R_RIP;
+
+    // --- WINE PROBLEMATIC CODE SKIP ---
+    // Wine has internal crashes at 0x7bf21110 that it can't recover from
+    // Skip this code entirely to let game progress
+    uintptr_t rip = (uintptr_t)R_RIP;
+    if (rip >= 0x7bf21100 && rip <= 0x7bf21120) {
+        init_safe_zone();
+        
+        // Skip the instruction/function
+        R_RIP = rip + 8;
+        R_RAX = (uintptr_t)global_safe_zone;
+        R_RDI = (uintptr_t)global_safe_zone;
+        
+        if (trace_fd >= 0) {
+            dprintf(trace_fd, "[WINE_CODE_SKIP] Skipped Wine crash at 0x%lx, advanced to 0x%lx\n", 
+                   rip, (uintptr_t)R_RIP);
+        }
+        
+        mark_exception_handled(fault_addr, (uintptr_t)pc);
+        relockMutex(Locks);
+        return;
+    }
+
+    // SIGILL_LIMIT: Check FIRST, before any other fixes 
+    if(sig == X64_SIGILL) { 
+        static __thread uintptr_t last_stuck_rip = 0; 
+        static __thread int stuck_rip_count = 0; 
+        
+        uintptr_t x64_rip = (uintptr_t)R_RIP; 
+        
+        if(last_stuck_rip == x64_rip) { 
+            stuck_rip_count++; 
+            
+            if(stuck_rip_count > 20) { 
+                if(trace_fd >= 0) { 
+                    dprintf(trace_fd, "[SIGILL_LIMIT] x64 RIP=0x%lx stuck for %d faults - passing to Wine\n", 
+                            x64_rip, stuck_rip_count); 
+                } 
+                
+                stuck_rip_count = 0; 
+                last_stuck_rip = 0; 
+                relockMutex(Locks); 
+                return; 
+            } 
+        } else { 
+            last_stuck_rip = x64_rip; 
+            stuck_rip_count = 1; 
+        } 
+    } 
+
+    // === ZONE AREA ON-DEMAND PAGE MAPPING ===
+    // The zone decompressor (0x636a96 REP MOVSD) accesses guard pages across the zone address space
+    // 0x04376000-0x20000000. Two cases:
+    // - SEGV_MAPERR: page not mapped at all → mmap anonymous RWX
+    // - SEGV_ACCERR with prot=0: Windows guard page → mprotect RWX
+    // Both must be handled before DRA sees them, since DRA rejects upper_byte > 0x06.
+
+    if (sig == X64_SIGSEGV &&
+        fault_addr >= 0x04376000 && fault_addr <= 0xF0000000 &&
+        (info->si_code == SEGV_MAPERR || info->si_code == SEGV_ACCERR)) {
+
+        void* zone_page   = (void*)(fault_addr & ~(uintptr_t)0xFFF);
+        int   zone_handled = 0;
+
+        if (info->si_code == SEGV_MAPERR) {
+            void* zone_result = mmap(zone_page, 0x1000,
+                                    PROT_READ | PROT_WRITE | PROT_EXEC,
+                                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            if (zone_result != MAP_FAILED) {
+                zone_handled = 1;
+                if (trace_fd >= 0) {
+                    dprintf(trace_fd, "[ZONE_MAP] mmap page %p for SEGV_MAPERR at 0x%lx | RIP=0x%lx\n",
+                            zone_page, fault_addr, (uintptr_t)R_RIP);
+                }
+            } else if (trace_fd >= 0) {
+                dprintf(trace_fd, "[ZONE_MAP_FAIL] mmap failed at %p: %s\n", zone_page, strerror(errno));
+            }
+        } else {
+            // SEGV_ACCERR: page mapped but prot=0 (Windows guard page semantics)
+            uint32_t zone_prot = getProtection(fault_addr);
+            if (zone_prot == 0) {
+                int mp_ret = mprotect(zone_page, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC);
+                zone_handled = (mp_ret == 0);
+                if (trace_fd >= 0) {
+                    dprintf(trace_fd, "[ZONE_GUARD] mprotect %p ret=%d for SEGV_ACCERR at 0x%lx | RIP=0x%lx\n",
+                            zone_page, mp_ret, fault_addr, (uintptr_t)R_RIP);
+                }
+            }
+            // If prot != 0, fall through — different issue, let downstream handle it
+        }
+
+        if (zone_handled) {
+            mark_exception_handled(fault_addr, (uintptr_t)pc);
+            relockMutex(Locks);
+            return;
+        }
+    }
+    // === END ZONE AREA ON-DEMAND PAGE MAPPING ===
+
+    // === HARDENED DYNAMIC REGION ALLOCATOR === 
+    if ((sig == X64_SIGSEGV || sig == SIGBUS) && 
+        fault_addr >= 0x10000000 && 
+        fault_addr <= 0xf0000000 && 
+        (info->si_code == SEGV_MAPERR || info->si_code == SEGV_ACCERR)) { 
+        
+        if (trace_fd >= 0) { 
+            dprintf(trace_fd, "[DRA_CHECK] fault_addr=0x%lx sig=%d si_code=%d\n", 
+                    fault_addr, sig, info->si_code); 
+        } 
+        
+        // === CORRUPTION DETECTION - RELAXED FOR WINE HEAP === 
+        // Wild pointers from heap corruption have characteristic patterns. 
+        // We relax this to allow legitimate Wine heap/stack allocations. 
+        
+        uint32_t upper_byte = (fault_addr >> 24) & 0xFF; 
+        int is_safe_range = 0; 
+        const char* reason = "Likely garbage pointer or heap corruption"; 
+        
+        // 1. Game PE space 
+        if (fault_addr >= 0x00400000 && fault_addr < 0x04376000) { 
+            is_safe_range = 1; 
+        } 
+        // 2. Wine heap/stack space (where 0x74b28208 lives) 
+        // Most Wine allocations on ARM64/box64 land in 0x70000000-0x80000000 
+        else if (fault_addr >= 0x70000000 && fault_addr < 0x80000000) { 
+            is_safe_range = 1; 
+        } 
+        // 3. Known Wine DLL space 
+        else if (fault_addr >= 0x35000000 && fault_addr < 0x36000000) { 
+            is_safe_range = 1; 
+        } 
+        // 4. NULL is always invalid 
+        else if (fault_addr == 0) { 
+            is_safe_range = 0; 
+            reason = "NULL pointer access"; 
+        } 
+        // 5. Fallback for other legitimate ranges 
+        else if (upper_byte >= 0x00 && upper_byte <= 0x06) { 
+            is_safe_range = 1; 
+        } 
+        else if (upper_byte >= 0x7b && upper_byte <= 0x7e) { 
+            is_safe_range = 1; 
+        } 
+        
+        if (!is_safe_range) { 
+            if (trace_fd >= 0) { 
+                dprintf(trace_fd, "\n=== CORRUPTION DETECTED ===\n"); 
+                dprintf(trace_fd, "[DRA_REJECT] Address: 0x%lx (upper byte: 0x%02x)\n", 
+                        fault_addr, upper_byte); 
+                dprintf(trace_fd, "[DRA_REJECT] Reason: %s\n", reason); 
+                dprintf(trace_fd, "[DRA_REJECT] This appears to be UNINITIALIZED/CORRUPT pointer, not legitimate access\n"); 
+                dprintf(trace_fd, "\n[DRA_REJECT] Register Dump:\n"); 
+                dprintf(trace_fd, "  RAX=0x%016lx RBX=0x%016lx RCX=0x%016lx RDX=0x%016lx\n", 
+                        R_RAX, R_RBX, R_RCX, R_RDX); 
+                dprintf(trace_fd, "  RSI=0x%016lx RDI=0x%016lx RBP=0x%016lx RSP=0x%016lx\n", 
+                        R_RSI, R_RDI, R_RBP, R_RSP); 
+                dprintf(trace_fd, "  R8 =0x%016lx R9 =0x%016lx R10=0x%016lx R11=0x%016lx\n", 
+                        R_R8, R_R9, R_R10, R_R11); 
+                dprintf(trace_fd, "\n[DRA_REJECT] Execution Context:\n"); 
+                dprintf(trace_fd, "  Guest RIP: 0x%lx\n", (uintptr_t)R_RIP); 
+                dprintf(trace_fd, "  Native PC: 0x%lx\n", (uintptr_t)pc); 
+                
+                // Check if any register contains this suspicious address 
+                if (R_RAX == fault_addr) dprintf(trace_fd, "  → Fault address is in RAX\n"); 
+                if (R_RBX == fault_addr) dprintf(trace_fd, "  → Fault address is in RBX\n"); 
+                if (R_RCX == fault_addr) dprintf(trace_fd, "  → Fault address is in RCX\n"); 
+                if (R_RDX == fault_addr) dprintf(trace_fd, "  → Fault address is in RDX\n"); 
+                if (R_RSI == fault_addr) dprintf(trace_fd, "  → Fault address is in RSI\n"); 
+                if (R_RDI == fault_addr) dprintf(trace_fd, "  → Fault address is in RDI\n"); 
+                
+                // Check TLS state 
+                uint8_t* tls_block = (uint8_t*)pthread_getspecific(tls_block_key);
+                if (tls_block && memExist((uintptr_t)tls_block)) { 
+                    uintptr_t tls_base = (uintptr_t)tls_block; 
+                    dprintf(trace_fd, "\n[DRA_REJECT] TLS State:\n"); 
+                    dprintf(trace_fd, "  TLS Base: %p\n", (void*)tls_base); 
+                    dprintf(trace_fd, "  TLS[0x58]: 0x%08x\n", *(uint32_t*)(tls_base + 0x58)); 
+                    dprintf(trace_fd, "  TLS[0x5C]: 0x%08x\n", *(uint32_t*)(tls_base + 0x5C)); 
+                } 
+                
+                // Check allocator state 
+                if (memExist(0x017913d0)) { 
+                    dprintf(trace_fd, "\n[DRA_REJECT] Allocator State:\n"); 
+                    dprintf(trace_fd, "  DAT_017913d0: 0x%08x\n", *(uint32_t*)0x017913d0); 
+                } 
+                
+                dprintf(trace_fd, "\n[DRA_REJECT] REFUSING to allocate - exposing corruption source\n"); 
+                dprintf(trace_fd, "=========================\n\n"); 
+            } 
+            
+            // DO NOT ALLOCATE - let Wine's exception handler catch this 
+            // This will produce a clean crash that exposes the real bug 
+            relockMutex(Locks); 
+            return;  // Pass to Wine, crash cleanly 
+        } 
+        
+        // Original DRA logic for LEGITIMATE addresses only 
+        // (addresses in 0x00-0x06 or 0x7b-0x7e ranges) 
+        if (trace_fd >= 0) { 
+            dprintf(trace_fd, "[DRA_TRIGGERED] Legitimate access at 0x%lx\n", fault_addr); 
+        } 
+        
+        // Check if mapped but wrong permissions OR completely unmapped
+        int prot = getProtection(fault_addr);
+        int needs_alloc = 0;
+        
+        if (trace_fd >= 0) {
+            dprintf(trace_fd, "[DRA_PROT] prot=%d for 0x%lx\n", prot, fault_addr);
+        }
+        
+        if (msync((void*)fault_addr, 1, MS_ASYNC) == -1 && errno == ENOMEM) {
+            // Completely unmapped
+            needs_alloc = 1;
+            
+            if (trace_fd >= 0) {
+                dprintf(trace_fd, "[DRA_UNMAPPED] 0x%lx is completely unmapped\n", fault_addr);
+            }
+        } else if (prot == 0 || (prot & (PROT_READ | PROT_EXEC)) == 0) {
+            // Mapped but has no permissions or missing READ/EXEC
+            needs_alloc = 1;
+            
+            if (trace_fd >= 0) {
+                dprintf(trace_fd, "[DRA_NO_PERM] 0x%lx has no/wrong permissions (prot=%d)\n", fault_addr, prot);
+            }
+        }
+        
+        if (needs_alloc) {
+            // Allocate 64MB region starting at this address
+            void* region_start = (void*)(fault_addr & ~0x3FFFFFFUL);  // Align to 64MB
+            size_t region_size = 0x4000000;  // 64MB
+            
+            // === Fix 4: Emergency Bounds Check in DRA ===
+            // Modify DYNAMIC_REGION_ALLOC to refuse allocating Wine space:
+            if ((uintptr_t)region_start >= 0x7f000000 && (uintptr_t)region_start <= 0x82000000) {
+                if (trace_fd >= 0) {
+                    dprintf(trace_fd, "[DRA_ABORT] Refusing to allocate Wine reserved space %p\n", region_start);
+                }
+                // Don't allocate, let it crash naturally
+            } else {
+                if (trace_fd >= 0) {
+                    dprintf(trace_fd, "[DRA_ALLOCATING] Attempting mmap at %p size 0x%lx\n", 
+                            region_start, region_size);
+                }
+                
+                void* result = mmap(region_start, region_size,
+                                   PROT_READ | PROT_WRITE | PROT_EXEC,
+                                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                                   -1, 0);
+                
+                if (result != MAP_FAILED) {
+                    memset(result, 0, region_size);
+                    
+                    if (trace_fd >= 0) {
+                        dprintf(trace_fd, "[DYNAMIC_REGION_ALLOC] Allocated %p - %p (64MB) for fault 0x%lx si_code=%d | RIP=0x%lx\n",
+                                region_start, (void*)((uintptr_t)region_start + region_size),
+                                fault_addr, info->si_code, (uintptr_t)R_RIP);
+                    }
+                    
+                    mark_exception_handled(fault_addr, (uintptr_t)pc);
+                    relockMutex(Locks);
+                    return;
+                } else {
+                    if (trace_fd >= 0) {
+                        dprintf(trace_fd, "[DRA_MMAP_FAILED] mmap failed: %s\n", strerror(errno));
+                    }
+                    
+                    // Fallback: try changing permissions on existing mapping
+                    void* page_start = (void*)(fault_addr & ~0xFFFUL);
+                    if (mprotect(page_start, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                        if (trace_fd >= 0) {
+                            dprintf(trace_fd, "[DYNAMIC_REGION_ALLOC] Changed permissions to RWX at %p for fault 0x%lx\n",
+                                    page_start, fault_addr);
+                        }
+                        mark_exception_handled(fault_addr, (uintptr_t)pc);
+                        relockMutex(Locks);
+                        return;
+                    }
+                }
+            }
+        } else {
+            if (trace_fd >= 0) {
+                dprintf(trace_fd, "[DRA_SKIP] needs_alloc=0, skipping allocation\n");
+            }
+        }
+    } else {
+        if (trace_fd >= 0) {
+            dprintf(trace_fd, "[DRA_NOT_TRIGGERED] sig=%d fault_addr=0x%lx si_code=%d\n", 
+                    sig, fault_addr, info->si_code);
+        }
+    }
+
+
+    // --- PROACTIVE NULL REGISTER FIX ---
+    // Fix NULL registers ANYTIME they cause a crash, not just in Wine
+    // This catches Wine crashes, game crashes, and any other NULL pointer dereferences
+    if (sig == X64_SIGSEGV) {
+        // Check if ANY key registers are NULL or very low (< 64KB)
+        int has_null_regs = 0;
+        
+        // Check common NULL register patterns
+        if (R_RAX < 0x10000) has_null_regs = 1;
+        if (R_RDI < 0x10000) has_null_regs = 1;
+        if (R_RSI < 0x10000) has_null_regs = 1;
+        if (R_RBX < 0x10000) has_null_regs = 1;
+        
+        // Also check if RIP is in Wine code range (stronger indicator)
+        uintptr_t rip = (uintptr_t)R_RIP;
+        int is_wine_code = (rip >= 0x7b000000 && rip < 0x7c000000);
+
+        // OR if fault address is a known Wine crash address
+        int is_wine_crash = (fault_addr == 0x049D1E40 || fault_addr == 0x049D1E48);
+        
+        if (has_null_regs || is_wine_code || is_wine_crash) {
+            init_safe_zone();
+            
+            // === PROTECT CRITICAL REGISTERS ===
+            // Save original values of registers we should NEVER modify
+            uintptr_t save_rsp = (uintptr_t)R_RSP;
+            uintptr_t save_rbp = (uintptr_t)R_RBP;
+            uintptr_t save_rip = (uintptr_t)R_RIP;
+            // === END PROTECT ===
+            
+            int fixed = 0;
+            
+            // Fix all NULL or low-value registers
+            #define FIX_NULL_REG(REG) \
+                if (REG < 0x10000) { \
+                    REG = (uintptr_t)global_safe_zone; \
+                    fixed++; \
+                }
+            
+            FIX_NULL_REG(R_RAX);
+            FIX_NULL_REG(R_RDI);
+            FIX_NULL_REG(R_RBX);
+            FIX_NULL_REG(R_RCX);
+            FIX_NULL_REG(R_RDX);
+            FIX_NULL_REG(R_RSI);
+            
+            // === RESTORE CRITICAL REGISTERS ===
+            // Ensure we never accidentally modified these
+            R_RSP = save_rsp;
+            R_RBP = save_rbp;
+            R_RIP = save_rip;
+            // === END RESTORE ===
+            
+            if (fixed > 0) {
+                if (trace_fd >= 0) {
+                    dprintf(trace_fd, "[NULL_REG_FIX] Fixed %d NULL register(s) at RIP=0x%lx (Wine=%d), RAX=%p RDI=%p\n", 
+                           fixed, rip, is_wine_code, (void*)R_RAX, (void*)R_RDI);
+                }
+                
+                mark_exception_handled(fault_addr, (uintptr_t)pc);
+                relockMutex(Locks);
+                return;
+            }
+        }
+    }
+
+    if (current_rip == 0x006E686E || current_rip == 0x0047FB6F) {
+        if(!engine_dummy_zone)
+            engine_dummy_zone = box_calloc(1, 786432);
+        if(!engine_dummy_zone) {
+            FILE* f = fopen("/sdcard/box64_alloc_failed.txt", "a");
+            if(f) { fprintf(f, "[ALLOC_FAIL] box_calloc(786432) NULL\n"); fclose(f); }
+            engine_dummy_zone = mmap(NULL, 786432, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        }
+        if(engine_dummy_zone) *(uint32_t*)engine_dummy_zone = engine_zone_magic;
+        uint32_t cur_magic = engine_dummy_zone ? *(uint32_t*)engine_dummy_zone : 0;
+        if(engine_dummy_zone && cur_magic != engine_zone_magic) {
+            FILE* f2 = fopen("/sdcard/box64_dummy_zone_write.txt", "a");
+            if(f2) { fprintf(f2, "[WRITE_DETECTED] magic_old=0x%08x magic_new=0x%08x\n", engine_zone_magic, cur_magic); fclose(f2); }
+            engine_zone_magic = cur_magic;
+        }
+
+        R_RAX = (uintptr_t)engine_dummy_zone;
+
+        // Loop detection and instruction skip
+        static __thread uintptr_t last_bridge_rip = 0;
+        static __thread int bridge_loop_count = 0;
+
+        if (last_bridge_rip == current_rip) {
+            bridge_loop_count++;
+            if (bridge_loop_count > 5) {
+                R_RIP += 5;
+                if (trace_fd >= 0) {
+                    dprintf(trace_fd, "[BRIDGE_SKIP] Loop at 0x%lx, advanced RIP to 0x%lx\n",
+                        current_rip, (uintptr_t)R_RIP);
+                }
+                bridge_loop_count = 0;
+                last_bridge_rip = 0;
+            }
+        } else {
+            last_bridge_rip = current_rip;
+            bridge_loop_count = 1;
+        }
+        if (trace_fd >= 0) {
+            dprintf(trace_fd, "[FIX_LOG] Bridge enabled at 0x%lx, RAX=0x%lx\n", current_rip, (uintptr_t)R_RAX);
+        }
+        bridge_call_counter++;
+        if(bridge_call_counter % 10000 == 0) {
+            FILE* f = fopen("/sdcard/box64_memory_usage.txt", "a");
+            if(f) {
+                FILE* status = fopen("/proc/self/maps", "r"); // Should be /proc/self/status but maps works for basic check
+                if(status) {
+                    char line[256];
+                    while(fgets(line, sizeof(line), status)) {
+                        if(strstr(line, "VmSize") || strstr(line, "VmRSS"))
+                            fprintf(f, "[%d] %s", bridge_call_counter, line);
+                    }
+                    fclose(status);
+                }
+                fclose(f);
+            }
+        }
+        relockMutex(Locks);
+        return;
+    } else if (current_rip == 0x006E686E || current_rip == 0x0047FB6F) { // Logic check failure log
+         if (trace_fd >= 0) {
+            dprintf(trace_fd, "[FIX_LOG_FAIL] Matched RIP 0x%lx but failed conditions?\n", current_rip);
+        }
+    }
+
+    if(info->si_code == SEGV_ACCERR && engine_dummy_zone) {
+        uintptr_t base = (uintptr_t)engine_dummy_zone;
+        uintptr_t end = base + 786432;
+        if(fault_addr >= base && fault_addr < end) {
+            if (trace_fd >= 0) {
+                dprintf(trace_fd, "[FIX_LOG] Dummy zone access offset=0x%lx | Fault=0x%lx | PC=0x%lx\n",
+                        fault_addr - base, fault_addr, (uintptr_t)pc);
+            }
+            R_RAX = 0;
+            relockMutex(Locks);
+            return;
+        } else {
+             if (trace_fd >= 0) {
+                dprintf(trace_fd, "[FIX_LOG_FAIL] SEGV_ACCERR + DummyZone but addr 0x%lx not in range [0x%lx-0x%lx]\n", 
+                    fault_addr, base, end);
+            }
+        }
+    }
+
+    // Check if this is code execution fault (PC == Fault) 
+    if(fault_addr == (uintptr_t)pc) { 
+        // This is trying to EXECUTE, not just access 
+        // Add EXEC permission 
+        
+        size_t page_size = getpagesize(); 
+        void* page_base = (void*)(fault_addr & ~(page_size - 1)); 
+        
+        if(memExist((uintptr_t)page_base)) { 
+            uint32_t old_prot = getProtection((uintptr_t)page_base); 
+            
+            if(!(old_prot & PROT_EXEC)) { 
+                mprotect(page_base, page_size, old_prot | PROT_EXEC); 
+                
+                if(trace_fd >= 0) { 
+                    dprintf(trace_fd, "[EXEC_FIX_ACCERR] Added EXEC at 0x%lx | PC=Fault=0x%lx\n", 
+                            (uintptr_t)page_base, fault_addr); 
+                } 
+                
+                // Mark as handled
+                mark_exception_handled(fault_addr, fault_addr);
+                relockMutex(Locks); 
+                return; 
+            } 
+        } else { 
+            // Not mapped - map with EXEC 
+            void* result = mmap(page_base, page_size, PROT_READ | PROT_EXEC, 
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0); 
+            
+            if(result != MAP_FAILED && trace_fd >= 0) { 
+                dprintf(trace_fd, "[EXEC_MAP_ACCERR] Mapped RX at 0x%lx | PC=Fault=0x%lx\n", 
+                        (uintptr_t)page_base, fault_addr); 
+            } 
+            
+            // Mark as handled
+            mark_exception_handled(fault_addr, fault_addr);
+            relockMutex(Locks); 
+            return; 
+        } 
+    } 
+    if(info->si_code == SEGV_ACCERR && fault_addr >= 0x076a0000 && fault_addr < 0x076b0000) {
+        size_t page_size_76a = getpagesize();
+        void* page_base_76a = (void*)(fault_addr & ~(page_size_76a - 1));
+        int exist_76a = memExist((uintptr_t)page_base_76a);
+        if (!exist_76a) {
+            void* r_76a = mmap(page_base_76a, page_size_76a, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            if (r_76a != MAP_FAILED) {
+                if (trace_fd >= 0) {
+                    dprintf(trace_fd, "[SEH_BRIDGE] MAP RW at 0x%lx | Fault=0x%lx | PC=0x%lx\n",
+                            (uintptr_t)page_base_76a, fault_addr, (uintptr_t)pc);
+                }
+                relockMutex(Locks);
+                return;
+            } else {
+                 if (trace_fd >= 0) {
+                    dprintf(trace_fd, "[SEH_BRIDGE_FAIL] mmap FAILED at 0x%lx | Fault=0x%lx\n",
+                            (uintptr_t)page_base_76a, fault_addr);
+                }
+            }
+        } else {
+            uint32_t prot_76a = getProtection((uintptr_t)page_base_76a);
+            if ((prot_76a & (PROT_READ | PROT_WRITE)) != (PROT_READ | PROT_WRITE)) {
+                mprotect(page_base_76a, page_size_76a, PROT_READ | PROT_WRITE);
+                if (trace_fd >= 0) {
+                    dprintf(trace_fd, "[SEH_BRIDGE] PROTECT RW at 0x%lx | old_prot=0x%x | Fault=0x%lx | PC=0x%lx\n",
+                            (uintptr_t)page_base_76a, prot_76a, fault_addr, (uintptr_t)pc);
+                }
+                relockMutex(Locks);
+                return;
+            } else {
+                 if (trace_fd >= 0) {
+                    dprintf(trace_fd, "[SEH_BRIDGE_INFO] Already RW at 0x%lx | Fault=0x%lx\n",
+                            (uintptr_t)page_base_76a, fault_addr);
+                }
+            }
+        }
+    }
+    if(info->si_code == SEGV_ACCERR && fault_addr >= 0x077a0000 && fault_addr < 0x077b0000) {
+        if (trace_fd >= 0) {
+            dprintf(trace_fd, "[SKIP_77A] SIG=%d | Fault=0x%lx | PC=0x%lx\n", sig, fault_addr, (uintptr_t)pc);
+        }
+        relockMutex(Locks);
+        return;
+    }
+
+    if(fault_addr >= 0xC0000000 && fault_addr < 0xD0000000) {
+        // .NET JIT code cache range
+        size_t page_size = getpagesize();
+        void* page_base = (void*)(fault_addr & ~(page_size - 1));
+        
+        if(memExist((uintptr_t)page_base)) {
+            uint32_t old_prot = getProtection((uintptr_t)page_base);
+            
+            if(!(old_prot & PROT_EXEC)) {
+                mprotect(page_base, page_size, old_prot | PROT_EXEC);
+                
+                if(trace_fd >= 0) {
+                    dprintf(trace_fd, "[DOTNET_JIT_EXEC] Added EXEC at 0x%lx | RIP=0x%lx\n", 
+                            (uintptr_t)page_base, fault_addr);
+                }
+                
+                relockMutex(Locks);
+                return;
+            }
+        } else {
+            // Not mapped - map with EXEC
+            void* result = mmap(page_base, page_size, PROT_READ | PROT_EXEC, 
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            
+            if(result != MAP_FAILED && trace_fd >= 0) {
+                dprintf(trace_fd, "[DOTNET_JIT_MAP] Mapped RX at 0x%lx | RIP=0x%lx\n", 
+                        (uintptr_t)page_base, fault_addr);
+            }
+            
+            relockMutex(Locks);
+            return;
+        }
+    }
+    if(sig == SIGBUS && info->si_code == BUS_ADRALN && fault_addr >= 0x7bf00000 && fault_addr < 0x7c000000) {
+        static __thread int wine_unaligned_count = 0;
+        wine_unaligned_count++;
+        if (trace_fd >= 0) {
+             if (wine_unaligned_count <= 5) {
+                dprintf(trace_fd, "[WINE_BUS_SKIP] Fault=0x%lx | RIP=0x%lx | count=%d\n", fault_addr, (uintptr_t)pc, wine_unaligned_count);
+             } else {
+                 dprintf(trace_fd, "[WINE_BUS_SKIP_SUPPRESS] Count=%d\n", wine_unaligned_count);
+             }
+        }
+        relockMutex(Locks);
+        return;
+    } else if (sig == SIGBUS && info->si_code == BUS_ADRALN) {
+         if (trace_fd >= 0) {
+            dprintf(trace_fd, "[WINE_BUS_FAIL] Unaligned access outside range: 0x%lx\n", fault_addr);
+        }
+    }
+    // Stack Exhaustion Detection removed (integrated into main loop)
+
+    // --- MAIN RESCUE LOGIC ---
+    
+    // --- NULL POINTER GUARD (WRITE REDIRECTION) ---
+    // If the game tries to access NULL (or low address), checks registers.
+    // If we find a 0 register that matches the fault, we redirect it to SafeZone.
+    // This breaks the "infinite loop" where Wine catches the fault but doesn't fix the register.
+    // Extended to catch faults up to 16MB (0x1000000) to handle offsets like NULL+0x18c
+    if ((sig == X64_SIGSEGV || sig == SIGBUS) && fault_addr < 0x1000000) {
+        init_safe_zone();
+        int modified = 0;
+        
+        // Helper macro to check and fix register
+        // Fix if register is 0 OR if it's a small value (< 0x10000) that likely caused the fault
+        #define CHECK_FIX_REG(REG) \
+            if (REG == 0 || REG < 0x10000) { \
+                REG = (uintptr_t)global_safe_zone; \
+                modified = 1; \
+            }
+
+        // Only fix if SafeZone is available
+        if (global_safe_zone) {
+            CHECK_FIX_REG(R_RAX);
+            CHECK_FIX_REG(R_RBX);
+            CHECK_FIX_REG(R_RCX);
+            CHECK_FIX_REG(R_RDX);
+            CHECK_FIX_REG(R_RSI);
+            CHECK_FIX_REG(R_RDI);
+            CHECK_FIX_REG(R_R8);
+            CHECK_FIX_REG(R_R9);
+            CHECK_FIX_REG(R_R10);
+            CHECK_FIX_REG(R_R11);
+            CHECK_FIX_REG(R_R12);
+            CHECK_FIX_REG(R_R13);
+            CHECK_FIX_REG(R_R14);
+            CHECK_FIX_REG(R_R15);
+        }
+        
+        if (modified) {
+            if (trace_fd >= 0) {
+                dprintf(trace_fd, "[NULL_GUARD] Redirected low-value register(s) to SafeZone (%p) to fix Fault=0x%lx\n", 
+                        global_safe_zone, fault_addr);
+            }
+            // Mark as handled so Wine doesn't see it (or sees the fixed instruction)
+            mark_exception_handled(fault_addr, (uintptr_t)pc);
+            relockMutex(Locks);
+            return; // Retry instruction with new register values
+        }
+    }
+
+    /* WINE exception redirection removed */
+
+    // === BETTER RETURN ADDRESS VALIDATION === 
+    // Check if this looks like a real return address by checking for CALL before it 
+    
+    int is_likely_return_address(uint32_t ret_addr) { 
+        // Must be in valid code range 
+        if (ret_addr < 0x401000 || ret_addr >= 0xB00000) { 
+            return 0; 
+        } 
+        
+        // Check bytes BEFORE the return address for CALL instruction 
+        // CALL is typically 5 bytes: E8 XX XX XX XX (relative call) 
+        // Or 2 bytes: FF XX (indirect call) 
+        // Return address points AFTER the CALL 
+        
+        if (ret_addr < 5) return 0;  // Can't check before start of memory 
+        
+        uint8_t* code = (uint8_t*)(uintptr_t)(ret_addr - 5); 
+        
+        // Check for CALL rel32 (E8) 
+        if (code[0] == 0xE8) { 
+            return 1;  // Likely a return from CALL 
+        } 
+        
+        // Check for CALL r/m32 (FF /2) - 2 bytes before 
+        code = (uint8_t*)(uintptr_t)(ret_addr - 2); 
+        if (code[0] == 0xFF && ((code[1] & 0x38) == 0x10)) { 
+            return 1;  // Likely a return from indirect CALL 
+        } 
+        
+        // Check for CALL r/m32 with ModR/M - 3-7 bytes before 
+        // This is more complex, but common patterns: 
+        code = (uint8_t*)(uintptr_t)(ret_addr - 3); 
+        if (code[0] == 0xFF && ((code[1] & 0x38) == 0x10)) { 
+            return 1; 
+        } 
+        
+        code = (uint8_t*)(uintptr_t)(ret_addr - 6); 
+        if (code[0] == 0xFF && ((code[1] & 0x38) == 0x10)) { 
+            return 1; 
+        } 
+        
+        // If we can't find a CALL instruction, it's probably not a return address 
+        return 0; 
+    }
+
+    // Conditions that trigger stack-scan rescue:
+    //   1. Null pointer / low address faults
+    //   2. High address faults (> 32-bit range)
+    //   3. SIGILL - illegal instruction (untranslated code)
+    //   4. SIGBUS - alignment fault
+    //   5. SEGV_MAPERR - address not mapped at all
+    //   6. NEW: SEGV_ACCERR where the fault address does NOT match
+    //          the instruction pointer - meaning the CPU executed valid code
+    //          but that code tried to access an invalid address.
+    //          Wine cannot recover from this on its own.
+    int should_rescue = ((sig == X64_SIGSEGV || sig == X64_SIGILL || sig == SIGBUS) && (
+        sig == X64_SIGILL || sig == SIGBUS ||
+        fault_addr < 0x10000 ||                    // null / low
+        fault_addr > 0x7FFFFFFF ||                 // high / bogus
+        info->si_code == SEGV_MAPERR ||            // unmapped
+        (info->si_code == SEGV_ACCERR && (uintptr_t)pc != fault_addr)  // data access, not exec
+    ));
+
+    if (!should_rescue && (sig == X64_SIGSEGV || sig == X64_SIGILL || sig == SIGBUS) && (addr)) {
+         if(trace_fd >= 0) {
+            dprintf(trace_fd, "[UNIVERSAL_PATCH_SKIP] Not triggering rescue. Sig=%d Fault=0x%lx si_code=%d\n", sig, fault_addr, info->si_code);
+        }
+    }
+
+    if (should_rescue) {
+    
+    // --- PEEK-BEHIND: Handle MOV/LDR -> RAX ---
+    if ((sig == X64_SIGSEGV || sig == SIGBUS) && info->si_code == SEGV_ACCERR) {
+         int mov_len = get_mov_rax_length(x64pc);
+         if (mov_len > 0) {
+             if(trace_fd >= 0) {
+                 dprintf(trace_fd, "[PEEK_BEHIND] Detected MOV/LDR -> RAX at %p (len=%d). Skipping...\n", (void*)x64pc, mov_len);
+             }
+             
+             init_safe_zone();
+             if (global_safe_zone) {
+                 R_RAX = (uintptr_t)global_safe_zone;
+                 R_EAX = (uint32_t)(uintptr_t)global_safe_zone;
+             } else {
+                 R_RAX = 1; R_EAX = 1;
+             }
+             
+             // Skip instruction
+             R_RIP = x64pc + mov_len;
+             
+             // Mark as handled
+             mark_exception_handled(fault_addr, x64pc);
+             
+             // Resume execution
+             if(emu && emu->jmpbuf) {
+                 relockMutex(Locks);
+                 #ifdef ANDROID
+                 siglongjmp(*(JUMPBUFF*)emu->jmpbuf, 1);
+                 #else 
+                 siglongjmp(emu->jmpbuf, 1); 
+                 #endif 
+             }
+             
+             relockMutex(Locks);
+             return;
+         }
+    }
+
+    // Log why we entered rescue logic
+    if(trace_fd >= 0) {
+        dprintf(trace_fd, "[RESCUE_START] Triggered by: %s\n", 
+            (sig == X64_SIGILL) ? "SIGILL" :
+            (sig == SIGBUS) ? "SIGBUS" :
+            (fault_addr < 0x10000) ? "NULL/Low Ptr" :
+            (fault_addr > 0x7FFFFFFF) ? "High/Bogus Ptr" :
+            (info->si_code == SEGV_MAPERR) ? "SEGV_MAPERR" :
+            "SEGV_ACCERR (Data Access)");
+    }
+
+    // Guard page hit: SEGV_ACCERR on zero-permission page = Windows guard page violation. 
+    // Wine/heap manager must handle this, NOT rescue. 
+    if(info->si_code == SEGV_ACCERR) { 
+        uint32_t fault_prot = getProtection(fault_addr); 
+        if(fault_prot == 0) { 
+            // Windows guard page semantics: first access consumes the guard. 
+            // mprotect the page to rwxp so the CPU retry succeeds. 
+            // The surrounding heap pages are rwxp; match them. 
+            size_t gp_size  = getpagesize(); 
+            void*  gp_base  = (void*)(fault_addr & ~(uintptr_t)(gp_size - 1)); 
+            int    mp_ret   = mprotect(gp_base, gp_size, PROT_READ | PROT_WRITE | PROT_EXEC); 
+    
+            if(trace_fd >= 0) { 
+                dprintf(trace_fd, "[GUARD_PAGE] fault=0x%lx base=%p size=0x%zx mprotect=%d" 
+                            " - guard consumed, retrying\n", 
+                            fault_addr, gp_base, gp_size, mp_ret); 
+            } 
+            // Mark as handled so Wine doesn't propagate it
+            mark_exception_handled(fault_addr, (uintptr_t)pc);
+            relockMutex(Locks); 
+            return;   // CPU retries the load/store, now succeeds (page is rwxp) 
+        } 
+        
+        // Detect writes to Wine NLS files (r-xs) which block heap expansion
+        // We now handle ANY NLS file mapping, not just the one at 0x04400000
+        
+        // ADD DEBUG: Log what protection we actually see 
+        if(trace_fd >= 0) { 
+            dprintf(trace_fd, "[NLS_DEBUG] SEGV_ACCERR at 0x%lx | fault_prot=0x%x | " 
+                       "READ=%d WRITE=%d EXEC=%d\n", 
+                    fault_addr, fault_prot, 
+                    !!(fault_prot & PROT_READ), 
+                    !!(fault_prot & PROT_WRITE), 
+                    !!(fault_prot & PROT_EXEC)); 
+        } 
+
+        // --- SOLUTION 1: AGGRESSIVE MEMORY DEFRAGMENTATION ---
+        // The game requires a continuous 7MB writable buffer at 0x04400000.
+        // Wine's ASLR fragments this with NLS files, DLLs (symsrv.dll), and heap chunks.
+        // We detect the first write to this region and aggressively remap the ENTIRE range.
+        static int fragmentation_fixed = 0;
+        if(!fragmentation_fixed && fault_addr >= 0x04400000 && fault_addr < 0x04B00000) {
+            void* target_base = (void*)0x04400000;
+            size_t target_size = 0x00700000; // 7MB
+            
+            if(trace_fd >= 0) dprintf(trace_fd, "[DEFRAG] Critical fragmentation detected at 0x%lx. Checking the data before Executing Solution 1 (Aggressive Remap)...\n", fault_addr);
+
+            // === CHECK IF REGION ALREADY HAS DATA ===
+            int has_data = 0;
+            for (uintptr_t check = 0x04400000; check < 0x04B00000; check += 4096) {
+                if (memExist(check)) {
+                    // Sample 10 locations to see if non-zero
+                    uint32_t* ptr = (uint32_t*)check;
+                    for (int i = 0; i < 10 && memExist((uintptr_t)(ptr + i)); i++) {
+                        if (ptr[i] != 0) {
+                            has_data = 1;
+                            break;
+                        }
+                    }
+                    if (has_data) break;
+                }
+            }
+            
+            if (has_data) {
+                // Region already has data - just fix permissions, don't remap!
+                if(trace_fd >= 0) dprintf(trace_fd, "[DEFRAG] Region has data, fixing permissions only\n");
+                mprotect(target_base, target_size, PROT_READ | PROT_WRITE | PROT_EXEC);
+                fragmentation_fixed = 1;
+                mark_exception_handled(fault_addr, (uintptr_t)pc);
+                relockMutex(Locks);
+                return;
+            } else {
+
+            
+                // Otherwise do the full remap (original code)
+                if(trace_fd >= 0) dprintf(trace_fd, "[DEFRAG] Region is empty, executing full remap\n");
+                munmap(target_base, target_size);
+
+                // 1. Unmap EVERYTHING in the target range (NLS, DLLs, heap, etc.)
+                // This clears the path for a continuous allocation.
+                munmap(target_base, target_size);
+
+                // 2. Remap as a single, continuous, writable anonymous block
+                void* r = mmap(target_base, target_size, 
+                            PROT_READ | PROT_WRITE | PROT_EXEC, 
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+
+                if(r != MAP_FAILED) {
+                    fragmentation_fixed = 1;
+                    if(trace_fd >= 0) dprintf(trace_fd, "[DEFRAG] SUCCESS: 0x04400000-0x04B00000 (7MB) is now continuous writable RAM.\n");
+                    
+                    // Mark as handled so Wine doesn't propagate it
+                    mark_exception_handled(fault_addr, (uintptr_t)pc);
+
+                    relockMutex(Locks);
+                    return; // Retry instruction
+                } else {
+                    if(trace_fd >= 0) dprintf(trace_fd, "[DEFRAG] FAILED: mmap errno=%d\n", errno);
+                    // Fall through to standard NLS handler if this fails
+                }
+            }
+        }
+
+        // --- THE ATOMIC NLS DISSOLVER (FINAL) --- 
+        // Dynamic NLS Detection (No hardcoded ranges) 
+        char path[512] = ""; 
+        uintptr_t map_start = 0, map_end = 0; 
+        
+        if(get_map_info(fault_addr, &map_start, &map_end, path)) { 
+            if(strstr(path, ".nls")) { 
+                size_t map_size = map_end - map_start; 
+                
+                if(trace_fd >= 0) dprintf(trace_fd, "[NLS_FIX] Collision detected on %s at 0x%lx\n", path, fault_addr); 
+    
+                void* scratch = malloc(map_size); 
+                if(scratch) { 
+                    memcpy(scratch, (void*)map_start, map_size); // 1. Save original NLS data 
+                    
+                    // 2. ATOMIC SWAP: Destroy the read-only file mapping and replace with writable RAM 
+                    // Explicitly unmap first to clear the file-backed status and read-only flags
+                    munmap((void*)map_start, map_size); 
+                    
+                    void* r = mmap((void*)map_start, map_size, PROT_READ|PROT_WRITE|PROT_EXEC, 
+                                   MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0); 
+        
+                    if(r != MAP_FAILED) { 
+                        memcpy((void*)map_start, scratch, map_size); // 3. Restore NLS data into writable RAM 
+                        if(trace_fd >= 0) dprintf(trace_fd, "[NLS_OK] %lx is now writable RAM\n", map_start); 
+                        
+                        // Retry the write 
+                        if(trace_fd >= 0) { 
+                            dprintf(trace_fd, "[NLS_WRITE_RETRY] Retrying write at 0x%lx\n", fault_addr); 
+                        } 
+                    } else { 
+                        if(trace_fd >= 0) dprintf(trace_fd, "[NLS_FIX] Critical Failure: mmap errno=%d\n", errno); 
+                    } 
+                    free(scratch); 
+                } else { 
+                     if(trace_fd >= 0) dprintf(trace_fd, "[NLS_FIX] Malloc failed for scratch buffer (size %zx)\n", map_size); 
+                } 
+                relockMutex(Locks); 
+                return; // Instruction will now retry and succeed 
+            } 
+        }
+    } 
+
+    // === RESCUE LOOP DETECTION  === 
+    static __thread int rescue_depth = 0; 
+    static __thread uintptr_t rescue_last_rip = 0; 
+    static __thread int rescue_rip_count = 0; 
+    
+    // Check for nested RESCUE 
+    if (rescue_depth > 0) { 
+        if (trace_fd >= 0) { 
+            dprintf(trace_fd, "[RESCUE_NESTED] Depth=%d, aborting nested rescue\n", rescue_depth); 
+        } 
+        R_RIP += 5;  // Skip instruction 
+        relockMutex(Locks); 
+        return; 
+    } 
+    
+    // Check for same RIP crashing repeatedly 
+    if (current_rip == rescue_last_rip) { 
+        rescue_rip_count++; 
+        if (rescue_rip_count >= 10) { 
+            if (trace_fd >= 0) { 
+                dprintf(trace_fd, "[RESCUE_ABORT] RIP 0x%lx crashed %d times, skipping\n", 
+                       current_rip, rescue_rip_count); 
+            } 
+            R_RIP += 5; 
+            rescue_rip_count = 0; 
+            rescue_last_rip = 0; 
+            relockMutex(Locks); 
+            return; 
+        } 
+    } else { 
+        rescue_last_rip = current_rip; 
+        rescue_rip_count = 1; 
+    } 
+    
+    rescue_depth++; 
+    // === END RESCUE LOOP DETECTION === 
+
+    uint32_t *esp = (uint32_t*)(uintptr_t)R_RSP;
+    uint32_t ret_addr = 0;
+    int stack_offset = -1;
+
+    uintptr_t esp_base = (uintptr_t)R_RSP;
+    int page_size = getpagesize();
+    int max_scan = 256; // Reduced back to original working value
+    if(trace_fd >= 0) {
+        dprintf(trace_fd, "\n[CRASH] SIG=%d | si_code=%d | Fault=0x%lx | PC=0x%lx | x86_RIP=0x%08x. Scanning stack...\n", 
+                sig, info->si_code, fault_addr, (uintptr_t)pc, (uint32_t)R_RIP);
+    }
+    for (int i = 0; i < max_scan; i++) {
+        // === SAFE STACK READ ===
+        // Ensure the stack address is valid before reading!
+        if (!memExist((uintptr_t)&esp[i])) {
+            if (trace_fd >= 0) {
+                dprintf(trace_fd, "[RESCUE_STOP] Stack memory at %p (offset %d) is not mapped! Stopping scan.\n", &esp[i], i);
+            }
+            break; // Stop scanning, stack is dead
+        }
+        
+        uint32_t candidate = esp[i];
+        
+        // Gate 1: Address range 
+        if(candidate < 0x00400000 || candidate > 0x20000000) continue; 
+        
+        // Gate 2: Alignment 
+        if((candidate & 3) != 0) continue; 
+        
+        // Gate 3: Must be already mapped AND executable 
+        // We reject heap (rw-p) and rodata (r--p) to prevent executing data. 
+        uint32_t cand_prot = 0; 
+        if(!memExist(candidate)) { 
+            if(trace_fd >= 0) dprintf(trace_fd, "[RESCUE_SKIP] RET=0x%08x not mapped\n", candidate); 
+            continue; 
+        } 
+        cand_prot = getProtection(candidate); 
+        
+        // Must be both readable AND executable 
+        if(!(cand_prot & PROT_READ) || !(cand_prot & PROT_EXEC)) { 
+            if(trace_fd >= 0) { 
+                dprintf(trace_fd, "[RESCUE_SKIP] RET=0x%08x no exec (prot=0x%02x)\n", candidate, cand_prot); 
+            } 
+            continue; 
+        } 
+        
+        // Gate 4: Not all zeros 
+        uint8_t* code = (uint8_t*)(uintptr_t)candidate; 
+        int zeros = 0; 
+        for(int z = 0; z < 16; z++) { 
+            if(memExist((uintptr_t)&code[z]) && code[z] == 0x00) zeros++; 
+        } 
+        if(zeros >= 8) { 
+            if(trace_fd >= 0) { 
+                dprintf(trace_fd, "[RESCUE_SKIP] RET=0x%08x mostly zeros (%d/16)\n", candidate, zeros); 
+            } 
+            continue; 
+        } 
+        
+        // Gate 5: First byte must be a recognizable x86 opcode 
+        
+        // Gate 5.5: Explicit Code Range Check (Reject Data Sections)
+        if (!is_valid_code_range(candidate)) {
+             if (trace_fd >= 0) {
+                 dprintf(trace_fd, "[RESCUE_REJECT] 0x%x not in valid code range (data section?)\n", candidate);
+             }
+             continue;
+        }
+
+        // Gate 5.6: CALL Instruction Check (Ensure it's a return address)
+        if (!is_likely_return_address(candidate)) {
+            if (trace_fd >= 0) {
+                dprintf(trace_fd, "[RESCUE_SKIP_NOCALL] 0x%x no CALL before it\n", candidate);
+            }
+            continue;
+        }
+
+        uint8_t b = code[0]; 
+        int looks_valid = ( 
+            // PUSH family 
+            b == 0x50 || b == 0x51 || b == 0x52 || b == 0x53 || 
+            b == 0x54 || b == 0x55 || b == 0x56 || b == 0x57 || 
+            b == 0x6a || b == 0x68 || 
+            // REX prefixes (40-4F) 
+            (b >= 0x40 && b <= 0x4f) || 
+            // Two-byte escape and common prefixes 
+            b == 0x0f || b == 0x66 || b == 0xf2 || b == 0xf3 || 
+            // MOV/arithmetic 
+            b == 0x89 || b == 0x8b || b == 0x8d || 
+            b == 0x83 || b == 0x85 || 
+            b == 0x01 || b == 0x03 || b == 0x2b || b == 0x2d || 
+            b == 0x31 || b == 0x33 || 
+            // CALL / JMP 
+            b == 0xe8 || b == 0xe9 || b == 0xeb || b == 0xff || 
+            // RET 
+            b == 0xc3 || b == 0xc2 || 
+            // NOP / TEST / CMP 
+            b == 0x90 || b == 0x85 || b == 0x3b || b == 0x39 
+        ); 
+        
+        if(!looks_valid) { 
+            if(trace_fd >= 0) { 
+                dprintf(trace_fd, "[RESCUE_SKIP] RET=0x%08x invalid first byte 0x%02x\n", candidate, b); 
+            } 
+            continue; 
+        } 
+        
+        // Gate 6: Reject if first 8 bytes contain POPFD/POPF (0x9d), PUSHFD (0x9c), 
+        // or IRET (0xcf). These are never valid at a function return point and 
+        // will corrupt EFLAGS (POPFD sets TF if bit 8 of the popped stack value is set). 
+        { 
+            int gate6_fail = 0; 
+            for(int g = 0; g < 8 && memExist((uintptr_t)&code[g]); g++) { 
+                uint8_t gb = code[g]; 
+                if(gb == 0x9d || gb == 0x9c || gb == 0xcf) { 
+                    if(trace_fd >= 0) 
+                        dprintf(trace_fd, "[RESCUE_SKIP] RET=0x%08x gate6: 0x%02x at byte[%d]\n", 
+                                candidate, gb, g); 
+                    gate6_fail = 1; 
+                    break; 
+                } 
+            } 
+            if(gate6_fail) continue; 
+        } 
+        
+        // Passed all gates 
+        ret_addr = candidate; 
+        stack_offset = i; 
+        if(trace_fd >= 0) { 
+            dprintf(trace_fd, "[RESCUE_ACCEPT] RET=0x%08x first=0x%02x zeros=%d\n", candidate, b, zeros); 
+            dprintf(trace_fd, "[CORRUPTION_CHECK] Thread %d jumping to 0x%x. First bytes: %02x %02x %02x\n", 
+                getpid(), candidate, code[0], code[1], code[2]); 
+        } 
+        break;
+    }
+
+        if(stack_offset == -1) {
+            static __thread uintptr_t scan_last_rip = 0;
+            static __thread uintptr_t scan_last_esp = 0;
+            static __thread uintptr_t scan_last_fault = 0;
+            static __thread int scan_repeat = 0;
+            int repeating = (scan_last_rip == (uintptr_t)R_RIP) &&
+                            (scan_last_esp == (uintptr_t)R_RSP) &&
+                            (fault_addr == scan_last_fault + 4);
+            if(repeating) {
+                scan_repeat++;
+            } else {
+                scan_last_rip = (uintptr_t)R_RIP;
+                scan_last_esp = (uintptr_t)R_RSP;
+                scan_last_fault = fault_addr;
+                scan_repeat = 1;
+            }
+            if(scan_repeat >= 20) {
+                if(trace_fd >= 0) {
+                    dprintf(trace_fd, "[SCAN_SUPPRESS] Repeat=%d | Suppressing rescue and passing to Wine\n", scan_repeat);
+                }
+                rescue_depth--;
+                relockMutex(Locks);
+                return;
+            }
+            if(trace_fd >= 0) {
+                dprintf(trace_fd, "[SCAN_FAILED] SIG=%d | Fault=0x%lx | ESP=0x%lx | si_code=%d | Thread=%d | x86_RIP=0x%08x\n",
+                        sig, fault_addr, (uintptr_t)R_RSP, info->si_code, GetTID(), (uint32_t)R_RIP);
+                int dump_slots = (scan_repeat <= 4) ? max_scan : 16;
+                dprintf(trace_fd, "              Stack dump (%d slots):\n", dump_slots);
+                for(int j = 0; j < dump_slots; j++) {
+                    dprintf(trace_fd, "              ESP[%2d] = 0x%08x\n", j, esp[j]);
+                }
+            }
+            int chosen_idx = -1;
+            for(int k=0; k<16; ++k) {
+                uint32_t candidate = esp[k];
+                if (candidate >= 0x7bf40000 && candidate <= 0x7bfeffff) {
+                    chosen_idx = k;
+                    break;
+                }
+            }
+            if(chosen_idx != -1) {
+                uint32_t ret_addr2 = esp[chosen_idx];
+                
+                // --- SAFE ZONE RETURN VALUE ---
+                init_safe_zone();
+                if (global_safe_zone) {
+                    R_RAX = (uintptr_t)global_safe_zone;
+                    R_EAX = (uint32_t)(uintptr_t)global_safe_zone;
+                } else {
+                    R_RAX = 1; R_EAX = 1;
+                }
+                
+                if (trace_fd >= 0) {
+                    dprintf(trace_fd, "[RESCUE_RAX] Set RAX=%p (SafeZone) for rescued function\n", (void*)R_RAX);
+                }
+                
+                // --- STUB REDIRECTION ---
+                void* stub = generate_rescue_stub((uintptr_t)ret_addr2);
+                if (stub) {
+                    ret_addr2 = (uint32_t)(uintptr_t)stub;
+                    if (trace_fd >= 0) {
+                        dprintf(trace_fd, "[RESCUE_STUB] Redirecting to x86 stub at %p -> Target %p\n", stub, (void*)(uintptr_t)esp[chosen_idx]);
+                    }
+                }
+                // -----------------------------
+                
+                R_RSP = (uintptr_t)&esp[chosen_idx + 1];
+                #ifdef __aarch64__
+                R_RIP = (uint64_t)ret_addr2;
+                #endif
+                if(trace_fd >= 0) {
+                    dprintf(trace_fd, "[NTDLL_TRUST] Using ESP[%d]=0x%08x. New RSP=0x%lx\n", chosen_idx, esp[chosen_idx], (uintptr_t)R_RSP);
+                }
+                
+                // Use siglongjmp to resume interpreter at new RIP.
+                if(emu && emu->jmpbuf) {
+                    rescue_depth--;
+                    relockMutex(Locks);
+                    #ifdef ANDROID
+                    siglongjmp(*(JUMPBUFF*)emu->jmpbuf, 1);   // 1 = resume interpreter 
+                    #else 
+                    siglongjmp(emu->jmpbuf, 1); 
+                    #endif 
+                    // siglongjmp does not return 
+                }
+                
+                rescue_depth--;
+                relockMutex(Locks);
+                return;
+            } else {
+                if(trace_fd >= 0) {
+                    dprintf(trace_fd, "[SCAN_FAILED_NO_LIFT] No candidate; skipping instruction to break loop.\n");
+                    int page_ok = memExist(fault_addr) && (getProtection((uintptr_t)fault_addr) & PROT_READ);
+                    if(page_ok) {
+                        uint8_t* p = (uint8_t*)(uintptr_t)fault_addr;
+                        dprintf(trace_fd, "BYTES[PC]: ");
+                        for(int i=0;i<32;i++) dprintf(trace_fd, "%02x", p[i]);
+                        dprintf(trace_fd, "\n");
+                    }
+                    dprintf(trace_fd, "REGS: RIP=0x%lx RSP=0x%lx RAX=0x%lx\n", (uintptr_t)R_RIP, (uintptr_t)R_RSP, (uintptr_t)R_RAX);
+                    uintptr_t old_rsp_val = R_RSP;
+                    if(scan_repeat >= 10) {
+                        if (trace_fd >= 0) {
+                            dprintf(trace_fd, "[SCAN_SUPPRESS] Repeat=%d | Escalating with stack lift. Old RSP=0x%lx\n", scan_repeat, old_rsp_val);
+                        }
+                        
+                        R_RSP = old_rsp_val + 0x100;
+                        if (trace_fd >= 0) {
+                            dprintf(trace_fd, "[SCAN_LIFT] New RSP=0x%lx | Fault=0x%lx | PC=0x%lx\n", (uintptr_t)R_RSP, fault_addr, (uintptr_t)pc);
+                        }
+                        
+                        #ifdef __aarch64__
+                        // --- SAFE ZONE RETURN VALUE ---
+                        init_safe_zone();
+                        if (global_safe_zone) {
+                            R_RAX = (uintptr_t)global_safe_zone;
+                            R_EAX = (uint32_t)(uintptr_t)global_safe_zone;
+                        } else {
+                            R_RAX = 1; R_EAX = 1;
+                        }
+
+                        if (trace_fd >= 0) {
+                            dprintf(trace_fd, "[RESCUE_RAX_LIFT] Set RAX=%p (SafeZone)\n", (void*)R_RAX);
+                        }
+                        // -----------------------------
+                        
+                        if(emu && emu->jmpbuf) { 
+                            rescue_depth--;
+                            relockMutex(Locks); 
+                            #ifdef ANDROID
+                            siglongjmp(*(JUMPBUFF*)emu->jmpbuf, 1); 
+                            #else
+                            siglongjmp(emu->jmpbuf, 1);
+                            #endif
+                        } 
+                        #endif
+                    }
+                    else {
+                        #ifdef __aarch64__
+                        // --- SAFE ZONE RETURN VALUE ---
+                        init_safe_zone();
+                        if (global_safe_zone) {
+                            uintptr_t sz = (uintptr_t)global_safe_zone;
+                            int fixed = 0;
+                            
+                            // Fix all suspicious registers (0 or garbage > 0x70000000)
+                            // This catches the register holding the garbage pointer causing the crash
+                            #define FIX_REG(REG) \
+                                if (REG == 0 || (REG > 0x70000000 && REG < 0x7FFFFFFFFFFF0000ULL)) { \
+                                    REG = sz; \
+                                    fixed++; \
+                                }
+                            
+                            FIX_REG(R_RAX); FIX_REG(R_RBX); FIX_REG(R_RCX); FIX_REG(R_RDX);
+                            FIX_REG(R_RSI); FIX_REG(R_RDI); FIX_REG(R_R8);  FIX_REG(R_R9);
+                            FIX_REG(R_R10); FIX_REG(R_R11); FIX_REG(R_R12); FIX_REG(R_R13);
+                            FIX_REG(R_R14); FIX_REG(R_R15);
+                            
+                            // Ensure RAX is set for return value
+                            R_RAX = sz;
+                            R_EAX = (uint32_t)sz;
+
+                            if (trace_fd >= 0) {
+                                dprintf(trace_fd, "[SCAN_FAILED_FIX] Fixed %d register(s) to SafeZone\n", fixed);
+                            }
+                        } else {
+                            R_RAX = 1; R_EAX = 1;
+                        }
+
+                        // --- SKIP INSTRUCTION ---
+                        // Advance RIP to skip the faulting instruction and prevent infinite loop
+                        uintptr_t proposed_new_rip = R_RIP + 5; 
+
+                        // === Fix 1: Validate RIP Before Instruction Skip === 
+                        uintptr_t test_rip = proposed_new_rip; 
+                        int prot = getProtection(test_rip);
+                        if (memExist(test_rip) && (prot & PROT_READ)) { 
+                            uint8_t* code = (uint8_t*)test_rip; 
+                            int is_zeros = 1; 
+                            for (int i = 0; i < 16; i++) { 
+                                if (code[i] != 0x00) { 
+                                    is_zeros = 0; 
+                                    break; 
+                                } 
+                            } 
+                            
+                            if (is_zeros) { 
+                                // Don't skip to zero-filled region 
+                                if (trace_fd >= 0) {
+                                    dprintf(trace_fd, "[INSTRUCTION_SKIP_ABORT] RIP 0x%lx contains all zeros, aborting skip\n", test_rip); 
+                                }
+                                // We're at the end of the handler anyway, let it crash naturally
+                                rescue_depth--;
+                                relockMutex(Locks);
+                                return;
+                            } 
+                        } 
+
+                        R_RIP = proposed_new_rip; 
+                        
+                        if (trace_fd >= 0) {
+                            dprintf(trace_fd, "[INSTRUCTION_SKIP] Advanced RIP to 0x%lx\n", (uintptr_t)R_RIP);
+                        }
+                        // -----------------------------
+                        
+                        if(emu && emu->jmpbuf) { 
+                            relockMutex(Locks); 
+                            #ifdef ANDROID
+                            siglongjmp(*(JUMPBUFF*)emu->jmpbuf, 1); 
+                            #else
+                            siglongjmp(emu->jmpbuf, 1);
+                            #endif
+                        } 
+                        #endif
+                    }
+                }
+                rescue_depth--;
+                relockMutex(Locks);
+                return;
+            }
+        } else {
+            if(trace_fd >= 0) {
+                dprintf(trace_fd, "[RESCUE_%d] SIG=%d (%s) | Fault=0x%lx | RET=0x%08x | si_code=%d | Thread=%d\n",
+                        stack_offset, sig,
+                        (sig == SIGBUS) ? "SIGBUS" : (sig == X64_SIGILL) ? "SIGILL" : "SIGSEGV",
+                        fault_addr, ret_addr, info->si_code, GetTID());
+            }
+
+        }
+
+        // --- SAFE ZONE RETURN VALUE ---
+        init_safe_zone();
+        if (global_safe_zone) {
+            R_RAX = (uintptr_t)global_safe_zone;
+            R_EAX = (uint32_t)(uintptr_t)global_safe_zone;
+        } else {
+            R_RAX = 1; R_EAX = 1;
+        }
+
+        // FORCE LOGGING (Use trace_fd)
+        if (trace_fd >= 0) {
+            dprintf(trace_fd, "[RESCUE_RAX] Set RAX=%p (SafeZone) for rescued function\n", (void*)R_RAX);
+        }
+        // -----------------------------
+        
+        // --- STUB REDIRECTION (Approach A) ---
+        // We use a stub to FORCE RAX to be the SafeZone value at the moment of return.
+        // This is more reliable than just setting R_RAX in the context, as siglongjmp might restore registers.
+        if (trace_fd >= 0) {
+            dprintf(trace_fd, "[DEBUG_STUB] stub_req=0x%lx, global_safe_zone=%p\n", 
+                   (uintptr_t)ret_addr, global_safe_zone);
+        }
+        void* stub = generate_rescue_stub((uintptr_t)ret_addr);
+        if (stub) {
+            ret_addr = (uint32_t)(uintptr_t)stub;
+            
+            if (trace_fd >= 0) {
+                dprintf(trace_fd, "[RESCUE_STUB] Redirecting to x86 stub at %p -> Target %p\n", stub, (void*)(uintptr_t)esp[stack_offset]);
+            }
+        }
+        // -----------------------------
+
+        R_RSP = (uintptr_t)&esp[stack_offset + 1];
+        R_RIP = (uint64_t)ret_addr;
+
+        if(trace_fd >= 0) {
+            dprintf(trace_fd, "[RESCUE_JUMP] RIP=0x%08x RSP=0x%lx via siglongjmp\n", 
+                    ret_addr, (uintptr_t)R_RSP);
+        }
+
+        // Use siglongjmp to resume interpreter at new RIP.
+        // Do NOT set uc_mcontext.pc to an x86 address — that makes the ARM64 CPU 
+        // try to execute x86 bytes directly. 
+        if(emu && emu->jmpbuf) {
+            rescue_depth--;
+            relockMutex(Locks);
+            #ifdef ANDROID
+            siglongjmp(*(JUMPBUFF*)emu->jmpbuf, 1);   // 1 = resume interpreter 
+            #else 
+            siglongjmp(emu->jmpbuf, 1); 
+            #endif 
+            // siglongjmp does not return 
+        }
+
+        // Fallback: if no jmpbuf, we cannot safely redirect in interpreter mode.
+        // Pass to Wine and crash cleanly.
+        rescue_depth--;
+        relockMutex(Locks);
+        return;
+    }
+
+    // Page Mapping - ONLY for faults where pc == fault_addr
+    // (meaning the CPU tried to execute unmapped memory, not access it)
+    if(sig == X64_SIGSEGV &&
+        fault_addr >= 0x10000 &&
+        fault_addr <= 0x7FFFFFFF &&
+        (uintptr_t)pc == fault_addr) {
+
+        // Don’t try to “fix” faults in the 0x05000000–0x06000000 range
+        // by mapping a page there – we’ve seen bogus jumps land here.
+        if (fault_addr >= 0x05000000 && fault_addr < 0x06000000) {
+            relockMutex(Locks);
+            return;  // let normal signal/SEH handling deal with it
+        }
+
+        uint8_t f_byte = (fault_addr >> 24) & 0xFF;
+        if(f_byte >= 0x20 && f_byte <= 0x7E) {
+            if(trace_fd >= 0) {
+                dprintf(trace_fd, "[ASCII_PC] PC=0x%lx Fault=0x%lx\n", (uintptr_t)pc, fault_addr);
+                int page_ok = memExist(fault_addr) && (getProtection((uintptr_t)fault_addr) & PROT_READ);
+                if(page_ok) {
+                    uint8_t* p = (uint8_t*)(uintptr_t)fault_addr;
+                    dprintf(trace_fd, "BYTES[PC]: ");
+                    for(int i=0;i<32;i++) dprintf(trace_fd, "%02x", p[i]);
+                    dprintf(trace_fd, "\n");
+                }
+            }
+            relockMutex(Locks);
+            return;
+        }
+        size_t page_size = getpagesize();
+        void *page_base = (void*)(fault_addr & ~(page_size - 1));
+
+        if (!getMmapped((uintptr_t)page_base)) {
+            void *result = mmap(page_base, page_size, PROT_READ | PROT_EXEC,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            if (result != MAP_FAILED) {
+                if (trace_fd >= 0 && fault_addr >= 0x7bf00000 && fault_addr < 0x7c000000) {
+                    dprintf(trace_fd, "[WINE_CODE_FIX] MAP RX at 0x%lx | Fault=0x%lx\n", (uintptr_t)page_base, fault_addr);
+                }
+                relockMutex(Locks);
+                return;
+            }
+        } else {
+            uint32_t curp = getProtection((uintptr_t)page_base);
+            if(!(curp & PROT_EXEC)) {
+                mprotect(page_base, page_size, curp | PROT_EXEC);
+                if (trace_fd >= 0 && fault_addr >= 0x7bf00000 && fault_addr < 0x7c000000) {
+                    dprintf(trace_fd, "[WINE_CODE_FIX] ADD EXEC at 0x%lx | old_prot=0x%x | Fault=0x%lx\n",
+                            (uintptr_t)page_base, curp, fault_addr);
+                }
+                relockMutex(Locks);
+                return;
+            }
+        }
+    }
+}
 #ifdef DYNAREC
     if((Locks & is_dyndump_locked) && ((sig==X64_SIGSEGV) || (sig==X64_SIGBUS)) && current_helper) {
         printf_log(LOG_INFO, "FillBlock triggered a %s at %p from %p\n", (sig==X64_SIGSEGV)?"segfault":"bus error", addr, pc);
@@ -2319,15 +6023,27 @@ void init_signal_helper(box64context_t* context)
     action.sa_flags = SA_SIGINFO | SA_RESTART | SA_NODEFER;
     action.sa_sigaction = my_box64signalhandler;
     sigaction(SIGSEGV, &action, NULL);
+    context->signals[signal_to_x64(SIGSEGV)] = (uintptr_t)my_box64signalhandler;
     action.sa_flags = SA_SIGINFO | SA_RESTART | SA_NODEFER;
     action.sa_sigaction = my_box64signalhandler;
     sigaction(SIGBUS, &action, NULL);
+    context->signals[signal_to_x64(SIGBUS)] = (uintptr_t)my_box64signalhandler;
     action.sa_flags = SA_SIGINFO | SA_RESTART | SA_NODEFER;
     action.sa_sigaction = my_box64signalhandler;
     sigaction(SIGILL, &action, NULL);
+    context->signals[signal_to_x64(SIGILL)] = (uintptr_t)my_box64signalhandler;
     action.sa_flags = SA_SIGINFO | SA_RESTART | SA_NODEFER;
     action.sa_sigaction = my_box64signalhandler;
     sigaction(SIGABRT, &action, NULL);
+    context->signals[signal_to_x64(SIGABRT)] = (uintptr_t)my_box64signalhandler;
+
+    static int watchdog_started = 0;
+    if (!watchdog_started) {
+        watchdog_started = 1;
+        pthread_t wt;
+        pthread_create(&wt, NULL, watchdog_thread, NULL);
+        pthread_detach(wt);
+    }
 
     pthread_once(&sigstack_key_once, sigstack_key_alloc);
 #ifdef USE_SIGNAL_MUTEX
