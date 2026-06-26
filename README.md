@@ -29,4 +29,4 @@ While the game is not fully booting yet, significant hurdles in the boot sequenc
 
 ## Contributing
 
-**please do not open Pull Requests (PRs) just yet.** But contributions well be welcomed
+Contributions well be welcomed
