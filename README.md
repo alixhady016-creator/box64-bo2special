@@ -1,7 +1,7 @@
 # Box64 - Call of Duty: Black Ops 2 (BO2) Compatibility Fork
 
 **PROJECT STATUS: WORK IN PROGRESS / EXPERIMENTAL**
-As of right now, there is NO working patch to make BO2 fully playable. This fork is in active development.
+As of right now, there is NO working patch to make BO2 fully playable. This fork is under development.
 
 This is a specialized, experimental fork of **[Box64](https://github.com/ptitSeb/box64)** specifically targeted at patching x86_64 to ARM64 instruction translation, signal handling, and memory mapping trying to get **Call of Duty: Black Ops 2 (Redacted Version)** running on Android/ARM Linux. 
 
