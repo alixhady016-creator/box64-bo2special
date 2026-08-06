@@ -126,26 +126,6 @@ x64emurun:
                             }
         }
 
-	static uintptr_t main_thread_recent_addrs[32] = {0};
-	static int main_thread_addr_idx = 0;
-	static uint32_t cached_main_tid = 0;
-
-	if (memExist(0x0280a5c8)) {
-	    uint32_t main_tid = *(uint32_t*)0x0280a5c8;
-	    if (main_tid != 0 && (uint32_t)GetTID() == main_tid) {
-	        main_thread_recent_addrs[main_thread_addr_idx % 32] = addr;
-	        main_thread_addr_idx++;
-	        // dump the ring buffer every 1000 instructions so we can see where it's spinning/stuck
-	        if (main_thread_addr_idx % 1000 == 0) {
-	            dprintf(trace_fd_emu, "[MAIN_THREAD_LOC] tid=%d idx=%d recent addrs:", GetTID(), main_thread_addr_idx);
-	            for (int i = 0; i < 32; i++)
-	                dprintf(trace_fd_emu, " 0x%lx", (unsigned long)main_thread_recent_addrs[(main_thread_addr_idx + i) % 32]);
-	            dprintf(trace_fd_emu, "\n");
-	        }
-	    }
-	}
-
-
         #ifndef TEST_INTERPRETER
         // check the TRACE flag before going to next
         if(tf) {
