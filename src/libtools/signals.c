@@ -12,6 +12,7 @@
 #include <setjmp.h>
 #include <sys/mman.h>
 #include <pthread.h>
+#include <dirent.h>
 
 // Validate if address is in executable code section
 static int is_valid_code_range(uint32_t addr) {
@@ -214,7 +215,7 @@ static void init_fake_tls() {
     if (this_tid == 0) this_tid = 1; 
 
     uint32_t global_tid = 0; 
-    if (memExist(0x0280a5c8)) { 
+    if (memExist(0x0280a5c8) && (getProtection(0x0280a5c8) & PROT_READ)) { 
         global_tid = *(uint32_t*)0x0280a5c8; 
     } 
 
@@ -222,27 +223,44 @@ static void init_fake_tls() {
         // Main thread – set global and local TID 
         *(uint32_t*)0x0280a5c8 = this_tid; 
         *(uint32_t*)(tls_block + 0x5C) = this_tid; 
-    } else { 
-        // Let it be 0, worker threads will initialize it later by themselves
-        *(uint32_t*)(tls_block + 0x5C) = 0; 
-    } 
+    }
+
+    // Populate the real TEB ClientId.UniqueThread field at offset +0x24.
+    // This is what Windows' actual GetCurrentThreadId() implementation reads
+    // (via FS:[0x18] -> TEB self-pointer -> [TEB+0x24]).
+    *(uint32_t*)(tls_block + 0x24) = this_tid;
+
+    // Worker threads: do NOT touch TLS[0x5C] here. allocate_tls_block() 
+    // already memset the block to 0 exactly once, on first allocation
 
     // TLS[0x58] will be linked lazily in the signal handler 
     *(uint32_t*)(tls_block + 0x58) = 0; 
     
-    init_trace_fd(); 
-    if (trace_fd >= 0) { 
-        dprintf(trace_fd, "[TLS_INIT] Fake TLS Initialized at %p\n", tls_block); 
-        dprintf(trace_fd, "           - FS:[0x2C] -> Array at %p\n", &tls_block[0x400]); 
-        dprintf(trace_fd, "           - TLS[0x5C] (TID) = %u (Global=0x%x)\n", this_tid, memExist(0x0280a5c8) ? *(uint32_t*)0x0280a5c8 : 0); 
-        dprintf(trace_fd, "           - 32-bit safe address: 0x%08lx\n", tls_addr); 
+    init_trace_fd();
+    if (trace_fd >= 0) {
+        dprintf(trace_fd, "[TLS_INIT] Fake TLS Initialized at %p\n", tls_block);
+        dprintf(trace_fd, "           - FS:[0x2C] -> Array at %p\n", &tls_block[0x400]);
+        dprintf(trace_fd, "           - TLS[0x5C] (TID) = %u (Global=0x%x)\n", this_tid, memExist(0x0280a5c8) ? *(uint32_t*)0x0280a5c8 : 0);
+        dprintf(trace_fd, "           - 32-bit safe address: 0x%08lx\n", tls_addr);
+
+        uint32_t tls_idx = memExist(0x003a3be4) ? *(uint32_t*)0x003a3be4 : 0xdeadbeef;
+        uintptr_t tls_base_ptr = (uintptr_t)&tls_block[0x400];
+        dprintf(trace_fd, "[TLS_INDEX] _tls_index = 0x%08x (at 0x003a3be4)\n", tls_idx);
+        dprintf(trace_fd, "[TLS_INDEX] FS:[0x2c] array slot for game = addr 0x%08lx, value = 0x%08x\n",
+                tls_base_ptr + tls_idx * 4,
+                memExist(tls_base_ptr + tls_idx * 4) ? *(uint32_t*)(tls_base_ptr + tls_idx * 4) : 0);
     } 
     
     // Force FS base to point to our fake TLS if possible 
     x64emu_t *emu = thread_get_emu(); 
     if(emu) { 
          emu->segs_offs[_FS] = (uintptr_t)tls_block; 
-         emu->segs_serial[_FS] = 0; // Mark as dirty/custom 
+         emu->segs_serial[_FS] = emu->context->sel_serial; // Match current global serial so GetSegmentBaseEmu() does NOT invalidate this override on the next FS access
+         dprintf(trace_fd, "[SERIAL_CHECK] segs_serial[FS]=%u context->sel_serial=%u match=%s\n",
+                    emu->segs_serial[_FS], emu->context->sel_serial,
+                                (emu->segs_serial[_FS] == emu->context->sel_serial) ? "YES" : "NO -- STALE OVERRIDE");
+         dprintf(trace_fd, "[TLS_FIX] segs_serial[_FS] stamped to context->sel_serial=%u (was %u)\n", emu->context->sel_serial, emu->segs_serial[_FS]);
+         dprintf(trace_fd, "[TLS_FIX] segs_offs[FS] set to %p\n", (void*)emu->segs_offs[_FS]);
     } 
 } 
 
@@ -1902,22 +1920,88 @@ static void* watchdog_thread(void* arg) {
         sleep(10);
         tick++;
         init_trace_fd();
-        if (trace_fd >= 0) {
-            dprintf(trace_fd, "[WATCHDOG] Tick=%d process still alive, no SIGSEGV for 10s\n", tick);
-            // Log current known state
-            if (memExist(0x0280a5c0)) {
-                dprintf(trace_fd, "[WATCHDOG] DAT_0280a5c0 = 0x%08x\n", *(uint32_t*)0x0280a5c0);
+        if (trace_fd < 0) continue;
+
+        dprintf(trace_fd, "[WATCHDOG] ===== Tick=%d =====\n", tick);
+
+        // Log known game .data addresses
+        if (memExist(0x0280a5c0) && (getProtection(0x0280a5c8) & PROT_READ))
+            dprintf(trace_fd, "[WATCHDOG] DAT_0280a5c0       = 0x%08x\n",
+                    *(uint32_t*)0x0280a5c0);
+        if (memExist(0x0280a5c8) && (getProtection(0x0280a5c8) & PROT_READ))
+            dprintf(trace_fd, "[WATCHDOG] DAT_0280a5c8       = 0x%08x (main TID)\n",
+                    *(uint32_t*)0x0280a5c8);
+        if (memExist(0x0280a628) && (getProtection(0x0280a5c8) & PROT_READ))
+            dprintf(trace_fd, "[WATCHDOG] DAT_0280a628       = 0x%08x (thread handle)\n",
+                    *(uint32_t*)0x0280a628);
+
+        // Log DAT_01258ff0 and DAT_01259950 — HMAC table pointer and sentinel
+        if (memExist(0x01258ff0) && (getProtection(0x0280a5c8) & PROT_READ))
+            dprintf(trace_fd, "[WATCHDOG] DAT_01258ff0       = 0x%08x (HMAC table ptr)\n",
+                    *(uint32_t*)0x01258ff0);
+        if (memExist(0x01259950) && (getProtection(0x0280a5c8) & PROT_READ))
+            dprintf(trace_fd, "[WATCHDOG] DAT_01259950       = 0x%08x (HMAC sentinel)\n",
+                    *(uint32_t*)0x01259950);
+        // Log DAT_03396074 — VEH handle, confirm it survives
+        if (memExist(0x03396074) && (getProtection(0x0280a5c8) & PROT_READ))
+            dprintf(trace_fd, "[WATCHDOG] DAT_03396074       = 0x%08x (VEH handle)\n",
+                    *(uint32_t*)0x03396074);
+
+        // Enumerate all threads via /proc/self/task and log wchan + state
+        // This shows what kernel function each thread is blocked in
+        // wchan = 0 means thread is running (not blocked in kernel)
+        char task_path[64];
+        DIR* task_dir = opendir("/proc/self/task");
+        if (task_dir) {
+            struct dirent* entry;
+            int thread_count = 0;
+            dprintf(trace_fd, "[WATCHDOG] Thread states:\n");
+            while ((entry = readdir(task_dir)) != NULL) {
+                if (entry->d_name[0] == '.') continue;
+                pid_t tid = (pid_t)atoi(entry->d_name);
+                if (tid == 0) continue;
+                thread_count++;
+
+                // Read wchan
+                char wchan[128] = "unknown";
+                snprintf(task_path, sizeof(task_path),
+                         "/proc/self/task/%d/wchan", tid);
+                int wfd = open(task_path, O_RDONLY);
+                if (wfd >= 0) {
+                    int n = read(wfd, wchan, sizeof(wchan)-1);
+                    if (n > 0) wchan[n] = '\0';
+                    else wchan[0] = '\0';
+                    close(wfd);
+                }
+
+                // Read thread name from comm
+                char comm[32] = "?";
+                snprintf(task_path, sizeof(task_path),
+                         "/proc/self/task/%d/comm", tid);
+                int cfd = open(task_path, O_RDONLY);
+                if (cfd >= 0) {
+                    int n = read(cfd, comm, sizeof(comm)-1);
+                    if (n > 0) {
+                        comm[n] = '\0';
+                        // Strip trailing newline
+                        if (n > 0 && comm[n-1] == '\n') comm[n-1] = '\0';
+                    }
+                    close(cfd);
+                }
+
+                dprintf(trace_fd, "[WATCHDOG]   TID=%-6d %-20s wchan=%s\n",
+                        tid, comm, wchan);
             }
-            if (memExist(0x0280a5c8)) {
-                dprintf(trace_fd, "[WATCHDOG] DAT_0280a5c8 = 0x%08x (main TID)\n", *(uint32_t*)0x0280a5c8);
-            }
-            if (memExist(0x0280a628)) {
-                dprintf(trace_fd, "[WATCHDOG] DAT_0280a628 = 0x%08x (thread handle)\n", *(uint32_t*)0x0280a628);
-            }
+            closedir(task_dir);
+            dprintf(trace_fd, "[WATCHDOG] Total threads: %d\n", thread_count);
+        } else {
+            dprintf(trace_fd, "[WATCHDOG] opendir(/proc/self/task) failed: %s\n",
+                    strerror(errno));
         }
     }
     return NULL;
 }
+
 
 void my_box64signalhandler(int32_t sig, siginfo_t* info, void * ucntx)
 {
@@ -1930,11 +2014,11 @@ void my_box64signalhandler(int32_t sig, siginfo_t* info, void * ucntx)
     // === VEH diagnostics (periodic) ===
     static int veh_check_counter = 0;
     if (trace_fd >= 0 && (veh_check_counter++ % 100 == 0)) {
-        if (memExist(0x03396074)) {
+        if (memExist(0x03396074) && (getProtection(0x0280a5c8) & PROT_READ)) {
             dprintf(trace_fd, "[VEH_CHECK #%d] DAT_03396074 = 0x%08x\n",
                     veh_check_counter, *(uint32_t*)0x03396074);
         }
-        if (memExist(0x03396078)) {
+        if (memExist(0x03396078) && (getProtection(0x0280a5c8) & PROT_READ)) {
             dprintf(trace_fd, "[VEH_CHECK #%d] DAT_03396078 = %p\n",
                     veh_check_counter, *(void**)0x03396078);
         }
@@ -1992,6 +2076,36 @@ void my_box64signalhandler(int32_t sig, siginfo_t* info, void * ucntx)
         x64emu_t* emu = thread_get_emu();
         if (emu && emu->segs_offs[_FS]) {
             *(uintptr_t*)(emu->segs_offs[_FS] + 0x58) = (uintptr_t)my_base;
+
+        // FIX: populate the TLS pointer array slot for this thread.
+        // FS:[0x2c] at TEB+0x2c is a POINTER to the TLS array, not the array itself.
+        // init_fake_tls() allocates the array separately (e.g. at 0x361a7b00) and stores
+        // that address at segs_offs[_FS]+0x2c. We must dereference that pointer first,
+        // then write my_base into slot _tls_index of the array.
+        // FUN_0047fb60: ECX=FS:[0x2c] → EDX=[ECX+_tls_index*4] → CMP [EDX+0x5c],0
+        {
+            uint32_t tls_idx = memExist(0x003a3be4) && (getProtection(0x0280a5c8) & PROT_READ) ? *(uint32_t*)0x003a3be4 : 0;
+            // Read the array pointer from TEB+0x2c (dereference FS:[0x2c])
+            uintptr_t tls_array_ptr = *(uintptr_t*)(emu->segs_offs[_FS] + 0x2c);
+            if (tls_array_ptr && my_base) {
+                // Write my_base into the correct slot of the array
+                *(uintptr_t*)(tls_array_ptr + tls_idx * sizeof(uintptr_t)) = (uintptr_t)my_base;
+                // Zero +0x5c so FUN_0047fb60's lazy GetCurrentThreadId() init fires correctly
+                *(uint32_t*)((uint8_t*)my_base + 0x5c) = 0;
+                if (trace_fd >= 0) {
+                    dprintf(trace_fd,
+                        "[TLS_LAZY_FIX] TLS array=0x%08lx slot[%u]=0x%p for TID=%d\n",
+                        tls_array_ptr, tls_idx, my_base, GetTID());
+                }
+            } else {
+                if (trace_fd >= 0) {
+                    dprintf(trace_fd,
+                        "[TLS_LAZY_FIX] WARNING: tls_array_ptr=0x%08lx my_base=%p — skipped\n",
+                        tls_array_ptr, my_base);
+                }
+            }
+        }
+
         }
         
         if (trace_fd >= 0) {
@@ -2521,9 +2635,11 @@ if (trace_fd >= 0) {
 #define RESUME_EXECUTION_INTERP() \
     do { \
         if(emu && emu->jmpbuf) { \
+            dprintf(trace_fd, "[RESUME_EXECUTION_INTERP] About to siglongjmp, target jmpbuf=%p, current R_RIP=0x%lx\n", (void*)emu->jmpbuf, R_RIP); \
             relockMutex(Locks); \
             siglongjmp(emu->jmpbuf, 1); \
         } else { \
+            dprintf(trace_fd, "[RESUME_EXECUTION_INTERP] No jmpbuf available, returning to signal handler emu = %p & emu->jmpbuf = %p\n", (void*)emu, emu ? (void*)emu->jmpbuf : NULL); \
             relockMutex(Locks); \
             return; \
         } \
@@ -2653,7 +2769,6 @@ if (guest_rip >= 0x49d1e40 && guest_rip <= 0x49d1e50) {
 }
 // === END FUNC_SKIP ===
 
-// === TLS SIMPLIFIED FIX (Replaces TLS_PROPER) === 
 // 1. Prevents reading corrupt _tls_index from uninitialized memory 
 // 2. Breaks infinite loop by manually executing instructions and advancing RIP 
 
@@ -2881,7 +2996,7 @@ if ((is_tls_fault && (in_tls_function || in_init_function)) ||
     } 
     uintptr_t tls_base = (uintptr_t)tls_block; 
     
-    // t6zm.exe .data section: 
+    // t6zm.exe .data section: (zeroing skipped)
     //   - Disk size:    0x302200 (3.15 MB) - initialized data from PE file 
     //   - Virtual size: 0x363a904 (57 MB)  - total allocation 
     //   - Uninitialized: 54 MB that should be zero but contains garbage 
@@ -2929,12 +3044,31 @@ if ((is_tls_fault && (in_tls_function || in_init_function)) ||
             dprintf(trace_fd, "[DATA_FIX] DAT_00cff6bc BEFORE zero-fill = 0x%08x\n", cff6bc_before);
         }
 
+        // Capture the six CreateEventA handles from FUN_006b2d00 before they are wiped.
+        uint32_t evt_0280a3ec = memExist(0x0280a3ec) ? *(uint32_t*)0x0280a3ec : 0;
+        uint32_t evt_0280a5c0 = memExist(0x0280a5c0) ? *(uint32_t*)0x0280a5c0 : 0;
+        uint32_t evt_0280a694 = memExist(0x0280a694) ? *(uint32_t*)0x0280a694 : 0;
+        uint32_t evt_0280a3f8 = memExist(0x0280a3f8) ? *(uint32_t*)0x0280a3f8 : 0;
+        uint32_t evt_0280a5c4 = memExist(0x0280a5c4) ? *(uint32_t*)0x0280a5c4 : 0;
+        uint32_t evt_0280a6a0 = memExist(0x0280a6a0) ? *(uint32_t*)0x0280a6a0 : 0;
+        dprintf(trace_fd, "[DATA_FIX] Captured event handles: E3ec=0x%08x E5c0=0x%08x E694=0x%08x E3f8=0x%08x E5c4=0x%08x E6a0=0x%08x\n",
+                evt_0280a3ec, evt_0280a5c0, evt_0280a694, evt_0280a3f8, evt_0280a5c4, evt_0280a6a0);
+                
+        // Save ONLY pool base pointer (slots are initialized later)
+        uint32_t saved_pool_base = 0;
+        if (memExist(0x01259a28)) {
+            saved_pool_base = *(uint32_t*)0x01259a28;
+            dprintf(trace_fd, "[DATA_FIX] Saved pool_base: 0x%08x\n", saved_pool_base);
+        }
+
         // Log slot monitoring
         if (memExist(0x01259b00)) {
             uint32_t s0_base_pre = *(uint32_t*)(0x01259b00 + 0x8020);
             uint32_t s0_size_pre = *(uint32_t*)(0x01259b00 + 0x8024);
             dprintf(trace_fd, "[DATA_FIX_TIMING] Slot[0] BEFORE zeroing: Base=0x%08x, Size=0x%08x\n", 
                     s0_base_pre, s0_size_pre);
+            dprintf(trace_fd, "[DATA_FIX_VERIFY] Captured real slot0_buffer_start=0x%08x vs guessed formula (pool_base+0x10) would be 0x%08x\n",
+                    s0_base_pre, saved_pool_base + 0x10);
         }
 
         // Log pool state BEFORE zeroing
@@ -2945,21 +3079,14 @@ if ((is_tls_fault && (in_tls_function || in_init_function)) ||
             dprintf(trace_fd, "[DATA_FIX_TIMING]   DAT_01259a28 = 0x%08x\n", pool_base_before);
             dprintf(trace_fd, "[DATA_FIX_TIMING]   DAT_01259a34 = 0x%08x\n", slot_counter_before);
             if (pool_base_before != 0) {
-                dprintf(trace_fd, "[DATA_FIX_WARNING] *** POOL WAS ALREADY INITIALIZED! Zeroing will destroy it! ***\n");
+                dprintf(trace_fd, "[DATA_FIX_WARNING] *** POOL HAS SOME PARTIAL INITIALIZATION ***\n");
             }
         }
-
-        // Save ONLY pool base pointer (slots are initialized later)
-        uint32_t saved_pool_base = 0;
-        if (memExist(0x01259a28)) {
-            saved_pool_base = *(uint32_t*)0x01259a28;
-            dprintf(trace_fd, "[DATA_FIX] Saved pool_base: 0x%08x\n", saved_pool_base);
-        }
-
+        
         // Zero entire .data section
-        memset((void*)zero_start, 0, zero_size);
-        dprintf(trace_fd, "[DATA_FIX] Zeroed entire .data: 0x%lx - 0x%lx (%zu MB)\n",
-                zero_start, zero_end, zero_size / 1024 / 1024);
+        // memset((void*)zero_start, 0, zero_size);
+        // dprintf(trace_fd, "[DATA_FIX] Zeroed entire .data: 0x%lx - 0x%lx (%zu MB)\n",
+        //        zero_start, zero_end, zero_size / 1024 / 1024);
 
         // Re-initialize Bootstrap structures
         *(uint32_t*)0x017913d0 = 0x30280000;
@@ -3090,28 +3217,34 @@ if ((is_tls_fault && (in_tls_function || in_init_function)) ||
     } 
     
     // === SIMPLIFIED TLS FIX === 
-    // Don't try to manipulate FS register - just ensure the TLS structure 
-    // at the current FS base is properly initialized 
-    
-    // Initialize TLS[0x5C] with thread ID if not set 
-    if (*(uint32_t*)(tls_base + 0x5C) == 0) { 
-        uint32_t tid = (uint32_t)syscall(__NR_gettid); 
-        if (tid == 0) tid = 1; 
-        *(uint32_t*)(tls_base + 0x5C) = tid; 
-    } 
+    // NOTE: This used to eagerly pre-write TLS[0x5C] with the real TID here,
+    // unconditionally, on every entry. That directly defeats the sentinel
+    // check in the in_tls_function/0x47fb6f branch below: it makes the
+    // sentinel non-zero BEFORE we ever decide whether the game's own
+    // GetCurrentThreadId()-based init (native code at 0x47fb7f) should be
+    // allowed to run. Removed — TLS[0x5C] is now owned exclusively by:
+    //   (a) init_fake_tls(), which zeroes it for worker threads, and
+    //   (b) the sentinel-check block below, which lets native fall-through
+    //       code write it for real when appropriate.
+    // Do NOT reintroduce a write to tls_base+0x5C anywhere above that block.
     
     // Initialize TLS[0x58] with pointer to DAT_0280a410 
     *(uint32_t*)(tls_base + 0x58) = 0x0280a410; 
     
     // Set global main thread ID 
-    if (memExist(0x0280a5c8)) { 
+    if (memExist(0x0280a5c8) && *(uint32_t*)0x0280a5c8 == 0) { 
         uint32_t current_tid = *(uint32_t*)(tls_base + 0x5C); 
         *(uint32_t*)0x0280a5c8 = current_tid; 
+        
+        if (trace_fd >= 0) {
+            dprintf(trace_fd, "[TLS_FIX] Set DAT_0280a5c8 = %u (main thread only)\n", current_tid);
+        }
     } 
     
     if (trace_fd >= 0) { 
         dprintf(trace_fd, "\n=== TLS SIMPLIFIED FIX ===\n"); 
-        dprintf(trace_fd, "[TLS_FIX] RIP: 0x%x\n", current_rip); 
+        dprintf(trace_fd, "[TLS_FIX] RIP: 0x%x, PC: 0x%lx, ESP: 0x%lx [ESP]=0x%08x, (tid=%d)\n",
+            current_rip, (unsigned long)pc, (unsigned long)R_ESP, *(uint32_t*)(uintptr_t)(R_ESP), GetTID()); 
         dprintf(trace_fd, "[TLS_FIX] TLS Base: %p\n", (void*)tls_base); 
         dprintf(trace_fd, "[TLS_FIX] TLS[0x5C] = %u (Thread ID)\n", *(uint32_t*)(tls_base + 0x5C)); 
         dprintf(trace_fd, "[TLS_FIX] TLS[0x58] = 0x0280a410\n"); 
@@ -3132,32 +3265,77 @@ if ((is_tls_fault && (in_tls_function || in_init_function)) ||
         relockMutex(Locks); 
         return; 
     } 
-     
+
+    if (trace_fd >= 0 && (in_tls_function || current_rip == 0x47fb6f || current_rip == 0x47fb67)) {
+        trace_x64emu_gate = 1;
+        dprintf(trace_fd, "[TLS_DIAG] trace_x64emu_gate is set to 0x%x\n", trace_x64emu_gate);
+        dprintf(trace_fd,
+            "[TLS_DIAG] emu=%p pre-fix EAX=0x%08x ECX=0x%08x EDX=0x%08x segs_offs[FS]=0x%08lx segs_serial[FS]=%u tls_block(pthread)=%p array_slot0_now=0x%08x\n",
+            (void*)emu,
+            emu->regs[_AX].dword[0],
+            emu->regs[_CX].dword[0],
+            emu->regs[_DX].dword[0],
+            (uintptr_t)emu->segs_offs[_FS],
+            emu->segs_serial[_FS],
+            pthread_getspecific(tls_block_key),
+            memExist((uintptr_t)pthread_getspecific(tls_block_key)+0x400) ? *(uint32_t*)((uint8_t*)pthread_getspecific(tls_block_key)+0x400) : 0xffffffff);
+        }
+
     if (in_tls_function || current_rip == 0x47fb6f) { 
         // === INTERPRETER MODE REGISTER FIX === 
         // In interpreter mode, registers are tracked in emu structure, NOT ucontext 
         // We must set BOTH for compatibility 
         
-        // Set emu structure registers (used by interpreter) 
-        emu->regs[_AX].dword[0] = 0;  // EAX = _tls_index = 0 (main module) 
-        emu->regs[_CX].dword[0] = (uint32_t)tls_base;  // ECX = TLS array base 
-        emu->regs[_DX].dword[0] = (uint32_t)tls_base;  // EDX = TLS block pointer 
+        // Reproduce the actual TLS lookup the game performs:
+        //   EAX = _tls_index (from 0x003a3be4, confirmed = 0)
+        //   ECX = FS:[0x2c]  (the TLS pointer array)
+        //   EDX = [ECX + EAX*4] (the per-thread TLS block)
+        // init_fake_tls() already wrote tls_block into all 128 slots of the array,
+        // so this resolves to tls_block — but computing it correctly means if
+        // _tls_index ever changes or EAX was non-zero at fault time, EDX is still right.
+        uint32_t tls_idx = memExist(0x003a3be4) ? *(uint32_t*)0x003a3be4 : 0;
+        uint32_t tls_array32 = *(uint32_t*)(tls_base + 0x2c); // FS:[0x2c], 32-bit guest ptr
+        uintptr_t tls_array = (uintptr_t)tls_array32;          // zero-extend, don't widen-read
+        uintptr_t candidate_addr = tls_array + (uintptr_t)tls_idx * 4;
+        uintptr_t tls_block_ptr = (tls_array && memExist(candidate_addr))
+                                  ? (uintptr_t)(*(uint32_t*)candidate_addr)  // slot is also 32-bit
+                                  : tls_base; // safe fallback
+        emu->regs[_AX].dword[0] = tls_idx;
+        emu->regs[_CX].dword[0] = (uint32_t)tls_array;
+        emu->regs[_DX].dword[0] = (uint32_t)tls_block_ptr;
+        R_RAX = tls_idx;
+        R_RCX = tls_array;
+        R_RDX = (uint32_t)tls_block_ptr;
         
-        // Also set ucontext for compatibility (may not be necessary in pure interpreter) 
-        R_RAX = 0; 
-        R_RCX = tls_base; 
-        R_RDX = (uint32_t)tls_base; 
-        
-        // Manually execute the CMP [EDX+0x5C], 0 to set flags 
-        uint32_t tid_in_tls = *(uint32_t*)(tls_base + 0x5C);  
-        uint32_t main_tid = memExist(0x0280a5c8) ? *(uint32_t*)0x0280a5c8 : tid_in_tls;  
-        
-        // Set ZF flag in emu structure (NOT ucontext eflags) 
-        if (tid_in_tls == main_tid) {  
-            emu->eflags.x64 |= (1 << 6);  // ZF=1 
-        } else {  
-            emu->eflags.x64 &= ~(1 << 6); // ZF=0 
-        }  
+        // Ghidra-confirmed semantics of FUN_0047fb60:
+        //   if (*(EDX+0x5C) == 0) { *(EDX+0x5C) = GetCurrentThreadId(); }
+        //   return *(EDX+0x5C) == DAT_0280a5c8;   <- unrelated epilogue check,
+        //                                            must NOT drive this branch.
+        // ZF here must reflect ONLY whether the sentinel at [EDX+0x5C] is zero.
+        // Do not write the sentinel — let the native fall-through
+        // at 0x47fb7f run for real (it does LEA/CALL GetCurrentThreadId/MOV),
+        // so the game's own init path executes exactly once, for real,
+        // exactly as it would on native Windows.
+        uint32_t *sentinel_ptr = (uint32_t*)(tls_block_ptr + 0x5C);
+        int sentinel_is_zero = memExist((uintptr_t)sentinel_ptr) && (*sentinel_ptr == 0);
+        if (trace_fd >= 0 && !sentinel_is_zero) {
+            dprintf(trace_fd,
+                "[TLS_FIX] WARNING: sentinel at %p already non-zero (0x%08x) on entry — "
+                "native init at 0x47fb7f will be skipped this call. If this fires on a "
+                "thread's FIRST fault, something upstream is writing TLS[0x5C] early.\n",
+                (void*)sentinel_ptr, *sentinel_ptr);
+        }
+
+        if (sentinel_is_zero) {
+            emu->eflags.x64 |= (1 << 6);   // ZF=1 -> JNZ not taken -> real init runs
+        } else {
+            emu->eflags.x64 &= ~(1 << 6);  // ZF=0 -> JNZ taken -> already inited, skip
+        }
+
+        if (trace_fd >= 0) {
+            dprintf(trace_fd, "[IAT_CHECK] Value at GetCurrentThreadId IAT slot 0x00b490fc = 0x%08x\n",
+                    memExist(0x00b490fc) ? *(uint32_t*)0x00b490fc : 0xffffffff);
+        }
         
         // Set guest RIP in emu structure (critical for interpreter mode!) 
         emu->ip.dword[0] = 0x47fb76;  // Jump to safe continuation point 
@@ -3167,7 +3345,10 @@ if ((is_tls_fault && (in_tls_function || in_init_function)) ||
             dprintf(trace_fd, "[TLS_FIX] Set emu->regs: EAX=0x%08x ECX=0x%08x EDX=0x%08x\n",  
                     emu->regs[_AX].dword[0], emu->regs[_CX].dword[0], emu->regs[_DX].dword[0]); 
             dprintf(trace_fd, "[TLS_FIX] Set emu->ip.dword[0] = 0x47fb76, ZF=%d\n",  
-                    (tid_in_tls == main_tid));  
+                    (sentinel_is_zero));  
+            dprintf(trace_fd, "[JMPBUF_CHECK] emu=%p emu->jmpbuf=%p (siglongjmp path %s)\n",
+                    (void*)emu, (void*)(emu ? emu->jmpbuf : NULL),
+                    (emu && emu->jmpbuf) ? "WILL fire" : "will NOT fire -- falling back to plain return()");
         }  
     } 
     else if (current_rip == 0x4cd229) { 
@@ -3878,6 +4059,7 @@ if((sig == X64_SIGSEGV || sig == X64_SIGILL || sig == SIGBUS) && (addr)) {
                     dprintf(trace_fd, "[ZONE_MAP] mmap page %p for SEGV_MAPERR at 0x%lx | RIP=0x%lx\n",
                             zone_page, fault_addr, (uintptr_t)R_RIP);
                 }
+
             } else if (trace_fd >= 0) {
                 dprintf(trace_fd, "[ZONE_MAP_FAIL] mmap failed at %p: %s\n", zone_page, strerror(errno));
             }

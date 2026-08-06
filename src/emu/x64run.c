@@ -25,6 +25,23 @@
 #ifdef DYNAREC
 #include "../dynarec/native_lock.h"
 #endif
+#include "fcntl.h"
+#include "stdio.h"
+#include "custommem.h"
+
+
+static int trace_fd_emu_inited = 0;
+static int trace_fd_emu = -1;
+static void init_trace_fd_emu(void)
+{
+    if(trace_fd_emu_inited)
+        return;
+    trace_fd_emu_inited = 1;
+    trace_fd_emu = open("/sdcard/box64_x64run_trace.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if(trace_fd_emu >= 0) {
+        dprintf(trace_fd_emu, "[X64RUN_TRACE_BOOT] trace fd open ok pid=%d\n", getpid());
+    }
+}
 
 #include "modrm.h"
 
@@ -50,6 +67,8 @@ int Run(x64emu_t *emu, int step)
     int step = 0;
     #endif
     uintptr_t addr = R_RIP;
+    init_trace_fd_emu();
+    // dprintf(trace_fd_emu, "[RUN_ENTRY] Run() called, addr=R_RIP=0x%lx, emu=%p, is signals.c gate open=%d\n", (unsigned long)addr, (void*)emu, trace_x64emu_gate);
     rex_t rex = {0};
     int unimp = 0;
     int is32bits = (emu->segs[_CS]==0x23);
@@ -82,6 +101,50 @@ x64emurun:
                 PrintTrace(emu, addr, 0);
 #endif
         emu->old_ip = addr;
+        static int max_trace_cap = 0;
+        if (trace_x64emu_gate && max_trace_cap <= 20000){
+            max_trace_cap++;
+            dprintf(trace_fd_emu, "[BOX64_TRACE#%d] tid=%d addr=0x%lx EAX=0x%x EBX=0x%x EDX=0x%x ECX=0x%x ESI=0x%x EDI=0x%x ESP=0x%x EBP=0x%x FS_base=0x%lx serial=%u/%u, is signals.c gate open=%d\n",
+                    max_trace_cap, GetTID(), (unsigned long)addr, (uint32_t)R_EAX, (uint32_t)R_EBX, (uint32_t)R_EDX, (uint32_t)R_ECX,
+                    (uint32_t)R_ESI, (uint32_t)R_EDI, (uint32_t)R_ESP, (uint32_t)R_EBP,
+                    (unsigned long)emu->segs_offs[_FS], emu->segs_serial[_FS], emu->context->sel_serial, trace_x64emu_gate);
+        }
+
+        if (addr == 0x006da4cf) {
+                dprintf(trace_fd_emu, "[MAINLOOP_CHECK] tid=%d DAT_02af7f00=0x%02x DAT_02af6f00=0x%02x\n",
+                            GetTID(),
+                                        memExist(0x02af7f00) ? *(uint8_t*)0x02af7f00 : 0xff,
+                                                    memExist(0x02af6f00) ? *(uint8_t*)0x02af6f00 : 0xff);
+        }
+
+        if (addr == 0x0060d1d9) {
+                char msgbuf[256] = {0};
+                    uint32_t buf_addr = R_ESP + 0x24;  // adjust if your ESP-relative offset differs after prologue
+                        if (memExist(buf_addr)) {
+                                memcpy(msgbuf, (void*)(uintptr_t)buf_addr, 255);
+                                        dprintf(trace_fd_emu, "[FATAL_ERROR_MSG] tid=%d msg=\"%s\"\n", GetTID(), msgbuf);
+                            }
+        }
+
+	static uintptr_t main_thread_recent_addrs[32] = {0};
+	static int main_thread_addr_idx = 0;
+	static uint32_t cached_main_tid = 0;
+
+	if (memExist(0x0280a5c8)) {
+	    uint32_t main_tid = *(uint32_t*)0x0280a5c8;
+	    if (main_tid != 0 && (uint32_t)GetTID() == main_tid) {
+	        main_thread_recent_addrs[main_thread_addr_idx % 32] = addr;
+	        main_thread_addr_idx++;
+	        // dump the ring buffer every 1000 instructions so we can see where it's spinning/stuck
+	        if (main_thread_addr_idx % 1000 == 0) {
+	            dprintf(trace_fd_emu, "[MAIN_THREAD_LOC] tid=%d idx=%d recent addrs:", GetTID(), main_thread_addr_idx);
+	            for (int i = 0; i < 32; i++)
+	                dprintf(trace_fd_emu, " 0x%lx", (unsigned long)main_thread_recent_addrs[(main_thread_addr_idx + i) % 32]);
+	            dprintf(trace_fd_emu, "\n");
+	        }
+	    }
+	}
+
 
         #ifndef TEST_INTERPRETER
         // check the TRACE flag before going to next

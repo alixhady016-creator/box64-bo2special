@@ -16,6 +16,11 @@ void CloneEmu(x64emu_t *newemu, const x64emu_t* emu);
 void CopyEmu(x64emu_t *newemu, const x64emu_t* emu);
 void SetTraceEmu(uintptr_t trace_start, uintptr_t trace_end);
 
+// Set to 1 by signals.c when COD BO2 TLS fault (FUN_0047fb60) is detected; gates SetFS diag logging.
+extern volatile int trace_x64emu_gate;
+// Native/host PC captured when trace_x64emu_gate is opened (from signal ucontext).
+extern volatile uintptr_t trace_last_host_pc;
+
 box64context_t* GetEmuContext(x64emu_t* emu);
 
 void ResetFlags(x64emu_t *emu);
